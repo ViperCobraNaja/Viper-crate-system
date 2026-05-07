@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(idf.py build *)",
+      "Bash(cmd.exe /c \"cd /d d:\\\\esp\\\\display_camera_csi && call D:\\\\Espressif\\\\frameworks\\\\esp-idf-v5.5.4\\\\export.bat > NUL && idf.py build 2>&1\")",
+      "Bash(cmd.exe /c \"cd /d D:\\\\esp\\\\display_camera_csi && call D:\\\\Espressif\\\\frameworks\\\\esp-idf-v5.5.4\\\\export.bat && idf.py build\")",
+      "Read(//d/esp/esp_brookesia_phone/main/**)",
+      "Bash(find \"d:/esp/esp_brookesia_phone\" -maxdepth 3 -type d -name \"*brookesia*\" 2>/dev/null || echo \"未找到 brookesia 目录\")",
+      "Read(//d/esp/esp_brookesia_phone/**)",
+      "Bash(ls -la \"D:/Espressif/frameworks/esp-idf-v5.5.4/components/\" 2>/dev/null | grep -i brookesia || echo \"IDF_PATH components 中没有 brookesia\")",
+      "Read(//d/Espressif/frameworks/esp-idf-v5.5.4/components/**)",
+      "Bash(find \"D:/esp/esp-dev-kits-master\" -maxdepth 5 -name \"*brookesia*\" -type d 2>/dev/null)",
+      "Read(//d/esp/esp-dev-kits-master/**)",
+      "Bash(ls \"D:/esp/esp-dev-kits-master/\" 2>/dev/null)"
+    ]
+  }
+}

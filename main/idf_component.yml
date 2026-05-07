@@ -1,0 +1,5 @@
+dependencies:
+  esp32_p4_function_ev_board:
+    version: '*'
+  espressif/esp_video: "~2.0"
+description: BSP Display and camera example

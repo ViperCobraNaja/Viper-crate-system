@@ -1,0 +1,13 @@
+# ESP-IDF 编译生成的文件（超大，可随时通过 idf.py build 重新生成）
+build/
+managed_components/
+dependencies.lock
+
+# 本地的配置文件（包含你的电脑路径和私密设置）
+sdkconfig
+sdkconfig.old
+
+# 编译器和 IDE 临时文件
+*.o
+*.d
+.vscode/
