@@ -36,8 +36,6 @@
 #include "esp_h264_enc_param_hw.h"
 #include "esp_h264_alloc.h"
 #include "app_video.h"
-#include "motion_detector.h"
-#include "video_recorder.h"
 #include "storage_manager.h"
 #include "esp_imgfx_color_convert.h"
 #include "esp_imgfx_types.h"
@@ -48,7 +46,7 @@
 #define ALIGN_UP(num, align)    (((num) + ((align) - 1)) & ~((align) - 1))
 
 /* 异步 SD 写入 —— 解耦编码 pipeline 与 SD 卡写入延迟 */
-#define ASYNC_WRITE_BUF_COUNT 3
+#define ASYNC_WRITE_BUF_COUNT 5
 #define ASYNC_WRITE_BUF_SIZE  (1536 * 1024)  /* 1.5MB 足够最大 IDR 帧 */
 
 /* 颜色转换方案: 1=ESP_IMGFX汇编优化, 0=CPU软件转换 */
@@ -64,8 +62,8 @@ typedef enum {
 } sys_state_t;
 
 /* 固定分辨率 —— 摄像头始终以录像分辨率运行 */
-#define CAM_WIDTH    1280
-#define CAM_HEIGHT   960
+#define CAM_WIDTH    800
+#define CAM_HEIGHT   800
 #define MON_WIDTH    320
 #define MON_HEIGHT   240
 
@@ -119,8 +117,6 @@ static uint8_t  *g_lcd_rgb_buf = NULL;     /* RGB565 LCD 画布 */
 
 /* 管理器句柄 */
 static storage_manager_handle_t g_storage = NULL;
-static video_recorder_handle_t  g_recorder = NULL;
-
 /* LVGL */
 static lv_obj_t *g_camera_canvas = NULL;
 static size_t    g_cache_line_size = 0;
@@ -132,9 +128,6 @@ static bool   g_file_open = false;
 /* 延迟状态切换 */
 static sys_state_t g_pending_state = SYS_STATE_MONITOR;
 static bool        g_has_pending_switch = false;
-
-/* 自动测试录像标志（绕过 video_recorder 状态机检查） */
-static bool g_auto_recording = false;
 
 /* ========================================================================== */
 /* 异步 SD 写入 —— 解耦 pipeline 与 SD 延迟                                  */
@@ -191,8 +184,19 @@ static QueueHandle_t g_frame_free_queue  = NULL;
 static QueueHandle_t g_frame_ready_queue = NULL;
 static TaskHandle_t  g_encode_task = NULL;
 
-/* 处理 task 局部帧计数器（用于启动自动录像等逻辑） */
+/* 处理 task 帧计数器 */
 static int g_encode_frame_count = 0;
+
+/* 简单 MV 运动检测 (基于 avg + MV 数量) */
+#define MOTION_TRIGGER_AVG         35
+#define MOTION_TRIGGER_MV_COUNT    200
+#define MOTION_TRIGGER_FRAMES      3
+#define MOTION_SUSTAIN_AVG         20
+#define MOTION_SUSTAIN_MV_COUNT    500
+#define RECORDING_CHECK_INTERVAL   5000000  /* 5 秒 */
+
+static int     g_motion_trigger_count = 0;
+static int64_t g_last_motion_check_us = 0;
 
 #if USE_ESP_IMGFX
 /* ESP_IMGFX 颜色转换: I420 → NV12 (汇编优化路径, 需要 cached 输入) */
@@ -216,11 +220,23 @@ static void encode_processor_task(void *arg)
         if (xQueueReceive(g_frame_ready_queue, &job, portMAX_DELAY) != pdTRUE) continue;
 
         g_encode_frame_count++;
+
+        /* ---- -1. 帧尺寸校验: 丢弃与当前编码器分辨率不匹配的帧 ---- */
+        {
+            uint32_t cur_w = (g_state == SYS_STATE_MONITOR) ? MON_WIDTH : CAM_WIDTH;
+            uint32_t cur_h = (g_state == SYS_STATE_MONITOR) ? MON_HEIGHT : CAM_HEIGHT;
+            if (job.enc_w != cur_w || job.enc_h != cur_h) {
+                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
+                continue;
+            }
+        }
+
         int64_t t_proc_start = esp_timer_get_time();
 
         /* ---- 0. 延迟状态切换 ---- */
         if (g_has_pending_switch) {
             g_has_pending_switch = false;
+            bool state_changed = (g_pending_state != g_state);
             switch_state(g_pending_state);
 
             if (g_state == SYS_STATE_RECORDING) {
@@ -232,24 +248,17 @@ static void encode_processor_task(void *arg)
                     CAM_WIDTH, CAM_HEIGHT, record_enc_cfg.fps, record_enc_cfg.rc.bitrate);
                 if (ret == ESP_OK) {
                     g_file_open = true;
+                    g_last_motion_check_us = esp_timer_get_time();
+                    g_motion_trigger_count = 0;
                     ESP_LOGI(TAG, "Recording START: %s", g_current_filename);
                 }
             }
-        }
 
-        /* ---- 自动测试录像 ---- */
-        if (g_encode_frame_count == 20 && g_state == SYS_STATE_MONITOR && g_recorder) {
-            ESP_LOGI(TAG, ">>> Startup auto-record triggered <<<");
-            g_auto_recording = true;
-            g_pending_state = SYS_STATE_RECORDING;
-            g_has_pending_switch = true;
-        } else if (g_encode_frame_count >= 80 && g_encode_frame_count < 81 &&
-                   g_state == SYS_STATE_RECORDING) {
-            ESP_LOGI(TAG, ">>> Stopping auto-record <<<");
-            g_auto_recording = false;
-            stop_recording();
-            g_pending_state = SYS_STATE_MONITOR;
-            g_has_pending_switch = true;
+            if (state_changed) {
+                /* 丢弃当前帧: 帧尺寸基于旧状态, 新编码器缓冲区尺寸不匹配会堆溢出 */
+                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
+                continue;
+            }
         }
 
         /* ---- 1. PPA 显示 (每 N 帧) ---- */
@@ -297,6 +306,10 @@ static void encode_processor_task(void *arg)
 #endif
         int64_t t_i420nv12 = esp_timer_get_time();
 
+        /* CPU 写 NV12 后写回 cache，确保编码器 DMA 可见 */
+        esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+
         /* ---- 3. H.264 硬件编码 ---- */
         esp_h264_enc_in_frame_t in_frame = {
             .raw_data.buffer = g_enc_nv12_buf,
@@ -317,67 +330,69 @@ static void encode_processor_task(void *arg)
         }
         int64_t t_h264 = esp_timer_get_time();
 
-        /* ---- 4. 提取硬件运动矢量 ---- */
+        /* 编码器 DMA 写输出后使 cache 无效，确保 CPU 读到最新数据 */
+        if (out_frame.length > 0) {
+            esp_cache_msync(g_enc_out_buf, g_enc_out_buf_size,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+        }
+
+        /* ---- 4. 提取硬件运动矢量并计算运动强度 ---- */
         uint32_t mv_len = 0;
         esp_h264_enc_hw_get_mv_data_len(g_h264_param, &mv_len);
 
-        static int debug_counter = 0;
-        if (++debug_counter % 50 == 0) {
-            video_record_state_t dbg_vr_state = RECORD_STATE_IDLE;
-            if (g_recorder) {
-                video_recorder_get_status(g_recorder, &dbg_vr_state, NULL, NULL);
+        uint32_t max_motion = 0;
+        uint32_t avg_motion = 0;
+        if (mv_len > 0) {
+            uint32_t total_motion = 0;
+            const esp_h264_enc_mv_data_t *mvs = (const esp_h264_enc_mv_data_t *)g_mv_pkt.data;
+            for (uint32_t j = 0; j < mv_len; j++) {
+                uint32_t m = abs(mvs[j].mv_x) + abs(mvs[j].mv_y);
+                if (m > max_motion) max_motion = m;
+                total_motion += m;
             }
-            const char *vr_str[] = {"IDLE","PRE_REC","REC","POST_REC","WRITE","ERR"};
+            avg_motion = total_motion / mv_len;
 
-            if (mv_len > 0) {
-                uint32_t max_motion = 0, total_motion = 0;
-                const esp_h264_enc_mv_data_t *mvs = (const esp_h264_enc_mv_data_t *)g_mv_pkt.data;
-                for (uint32_t j = 0; j < mv_len; j++) {
-                    uint32_t m = abs(mvs[j].mv_x) + abs(mvs[j].mv_y);
-                    if (m > max_motion) max_motion = m;
-                    total_motion += m;
+            static int debug_counter = 0;
+            if (++debug_counter % 50 == 0) {
+                ESP_LOGI(TAG, "MV:%" PRIu32 " max=%" PRIu32 " avg=%" PRIu32 " | state=%s file:%s",
+                         mv_len, max_motion, avg_motion,
+                         g_state == SYS_STATE_MONITOR ? "MON" : "REC",
+                         g_file_open ? "OPEN" : "-");
+            }
+        }
+
+        /* ---- 5. MV 运动检测 + 录像触发 ---- */
+        if (mv_len > 0) {
+            if (g_state == SYS_STATE_MONITOR) {
+                if (avg_motion > MOTION_TRIGGER_AVG && mv_len > MOTION_TRIGGER_MV_COUNT) {
+                    g_motion_trigger_count++;
+                    if (g_motion_trigger_count >= MOTION_TRIGGER_FRAMES) {
+                        ESP_LOGI(TAG, ">>> Motion trigger (avg=%" PRIu32 " mv=%" PRIu32 " x%d) -> RECORD <<<",
+                                 avg_motion, mv_len, g_motion_trigger_count);
+                        g_motion_trigger_count = 0;
+                        g_pending_state = SYS_STATE_RECORDING;
+                        g_has_pending_switch = true;
+                    }
+                } else {
+                    g_motion_trigger_count = 0;
                 }
-                ESP_LOGI(TAG, "MV:%" PRIu32 " max=%" PRIu32 " avg=%.1f | rec:%s file:%s",
-                         mv_len, max_motion,
-                         mv_len > 0 ? (float)total_motion / mv_len : 0.0f,
-                         vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
-                         g_file_open ? "OPEN" : "-");
-            } else {
-                ESP_LOGW(TAG, "MV:0 (no data!) | rec:%s file:%s",
-                         vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
-                         g_file_open ? "OPEN" : "-");
-            }
-        }
-
-        if (mv_len > 0 && g_recorder) {
-            video_recorder_process_hw_motion_vectors(
-                g_recorder, (const uint32_t *)g_mv_pkt.data,
-                mv_len, job.enc_w, job.enc_h, job.timestamp);
-
-            video_record_state_t vr_state;
-            video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
-
-            if (vr_state == RECORD_STATE_RECORDING && g_state == SYS_STATE_MONITOR) {
-                ESP_LOGI(TAG, ">>> Motion trigger → switching to RECORD <<<");
-                g_pending_state = SYS_STATE_RECORDING;
-                g_has_pending_switch = true;
-            }
-        }
-
-        /* 检查录像停止条件 */
-        if (g_state == SYS_STATE_RECORDING && g_file_open && g_recorder && !g_auto_recording) {
-            video_record_state_t vr_state;
-            video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
-            if (vr_state == RECORD_STATE_IDLE) {
-                stop_recording();
-                g_pending_state = SYS_STATE_MONITOR;
-                g_has_pending_switch = true;
+            } else if (g_state == SYS_STATE_RECORDING) {
+                if (avg_motion > MOTION_SUSTAIN_AVG || mv_len > MOTION_SUSTAIN_MV_COUNT) {
+                    g_last_motion_check_us = esp_timer_get_time();
+                }
+                int64_t now = esp_timer_get_time();
+                if (now - g_last_motion_check_us >= RECORDING_CHECK_INTERVAL) {
+                    ESP_LOGI(TAG, ">>> No motion for 5s -> stopping <<<");
+                    stop_recording();
+                    g_pending_state = SYS_STATE_MONITOR;
+                    g_has_pending_switch = true;
+                }
             }
         }
 
         int64_t t_mv_proc = esp_timer_get_time();
 
-        /* ---- 5. 录像态：异步写入 SD 卡 ---- */
+        /* ---- 6. 录像态：异步写入 SD 卡 ---- */
         if (g_state == SYS_STATE_RECORDING && g_file_open && out_frame.length > 0) {
             bool is_keyframe = (out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR ||
                                 out_frame.frame_type == ESP_H264_FRAME_TYPE_I);
@@ -689,7 +704,6 @@ static esp_err_t init_h264_encoder(const esp_h264_enc_cfg_hw_t *cfg)
 static void deinit_h264_encoder(void)
 {
     if (g_h264_enc) {
-        esp_h264_enc_close(g_h264_enc);
         esp_h264_enc_del(g_h264_enc);
         g_h264_enc = NULL;
         g_h264_param = NULL;
@@ -988,45 +1002,6 @@ void app_main(void)
                             8192, NULL, 5, &g_encode_task, 0);
     ESP_LOGI(TAG, "Encode processor task started on core 0");
 
-    /* ---- 录像器 ---- */
-    video_record_config_t vr_cfg = {
-        .monitor = {
-            .width   = MON_WIDTH,
-            .height  = MON_HEIGHT,
-            .fps     = monitor_enc_cfg.fps,
-            .bitrate = monitor_enc_cfg.rc.bitrate,
-            .format  = 0,
-        },
-        .recording = {
-            .width   = CAM_WIDTH,
-            .height  = CAM_HEIGHT,
-            .fps     = record_enc_cfg.fps,
-            .bitrate = record_enc_cfg.rc.bitrate,
-            .max_duration_ms  = 5 * 60 * 1000,
-            .post_trigger_ms  = 3000,
-        },
-        .storage = {
-            .base_path      = "/sdcard/videos",
-            .max_files      = 100,
-            .max_storage_mb = 4096,
-            .auto_delete    = true,
-        },
-        .motion_config = {
-            .threshold          = 5,
-            .min_area           = 1,
-            .cooldown_ms        = 2000,
-            .trigger_frames     = 1,
-            .pre_trigger_frames = 10,
-            .enable             = true,
-            .grid_cols          = MOTION_GRID_COLS,
-            .grid_rows          = MOTION_GRID_ROWS,
-        },
-    };
-    g_recorder = video_recorder_init(&vr_cfg);
-    if (!g_recorder) {
-        ESP_LOGW(TAG, "Video recorder init failed");
-    }
-
     /* ---- 打开摄像头：优先 YUV420，回退到 RGB565 ---- */
     video_fmt_t try_fmts[] = { APP_VIDEO_FMT_YUV420, APP_VIDEO_FMT_RGB565 };
     int fd = -1;
@@ -1093,6 +1068,5 @@ void app_main(void)
     if (g_cc_handle) esp_imgfx_color_convert_close(g_cc_handle);
 #endif
     deinit_h264_encoder();
-    if (g_recorder) video_recorder_deinit(g_recorder);
     if (g_storage) storage_manager_deinit(g_storage);
 }

@@ -11,7 +11,17 @@
       "Read(//d/Espressif/frameworks/esp-idf-v5.5.4/components/**)",
       "Bash(find \"D:/esp/esp-dev-kits-master\" -maxdepth 5 -name \"*brookesia*\" -type d 2>/dev/null)",
       "Read(//d/esp/esp-dev-kits-master/**)",
-      "Bash(ls \"D:/esp/esp-dev-kits-master/\" 2>/dev/null)"
+      "Bash(ls \"D:/esp/esp-dev-kits-master/\" 2>/dev/null)",
+      "Bash(find /d/esp -name \"ppa.h\" -type f 2>/dev/null | head -5)",
+      "Read(//d/esp/**)",
+      "Bash(cygpath -d \"C:\")",
+      "Bash(cmd.exe /c \"dir /s /b C:\\\\esp\\\\*ppa.h* 2>nul\")",
+      "Bash(cmd.exe /c \"dir /s /b C:\\\\Espressif\\\\*ppa.h* 2>nul\")",
+      "Bash(ls -d d:/esp-idf* d:/esp/esp-idf* d:/esp/v5* d:/v5* 2>/dev/null; ls -d /mnt/d/esp-idf* /mnt/d/esp/esp-idf* 2>/dev/null; echo \"---done---\")",
+      "Read(//mnt/**)",
+      "Bash(ls -d /[cdefh]/**/esp-idf 2>/dev/null || ls -d /mnt/[cdefh]/**/esp-idf 2>/dev/null || echo \"not found\")",
+      "Read(//d//**)",
+      "Bash(where idf.py)"
     ]
   }
 }

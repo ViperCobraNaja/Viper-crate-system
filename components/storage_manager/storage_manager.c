@@ -221,6 +221,7 @@ static esp_err_t update_storage_stats(storage_manager_t *manager)
 }
 
 static bool muxer_registered_flag = false;
+static storage_manager_t *s_cur_muxer_mgr = NULL;  /* url_pattern 简单回调无ctx, 用全局指针 */
 
 storage_manager_handle_t storage_manager_init(const storage_manager_config_t *config)
 {
@@ -366,41 +367,71 @@ esp_err_t storage_manager_get_stats(storage_manager_handle_t handle, storage_sta
 
 // ---- MP4 muxer 回调与辅助函数 ----
 
-// 自定义文件写入器，确保 fsync + 调试日志
+/* 文件预分配: 避免 FAT32 簇链分配在写入时触发 "三轮一次" */
+#define MUXER_PREALLOC_SIZE  (64 * 1024 * 1024)   /* 64MB, ~4分钟 2Mbps 录像 */
+
+static long s_muxer_write_end = 0;  /* 跟踪实际数据尾部, 用于 fclose 截断 */
+
+/* 自定义文件写入器, 含预分配 + 大缓冲 + fsync */
 static void *muxer_fopen(char *path)
 {
     FILE *f = fopen(path, "wb");
-    if (f) {
-        setvbuf(f, NULL, _IOFBF, 64 * 1024);
-        ESP_LOGI(TAG, "muxer: fopen(%s) OK", path);
-    } else {
+    if (!f) {
         ESP_LOGE(TAG, "muxer: fopen(%s) FAILED errno=%d", path, errno);
+        return NULL;
     }
+    /* 512KB FILE 缓冲, 合并小写为大批次, 减少 FAT 操作频率 */
+    setvbuf(f, NULL, _IOFBF, 512 * 1024);
+
+    /* 预分配 FAT 簇链: seek 到目标偏移-1, 写 1 字节强制分配所有簇,
+     * 然后 seek 回文件头. 后续写入无需再触发 FAT 表 read→update→write. */
+    if (fseek(f, MUXER_PREALLOC_SIZE - 1, SEEK_SET) == 0) {
+        fwrite("", 1, 1, f);
+        fflush(f);
+        fseek(f, 0, SEEK_SET);
+        ESP_LOGI(TAG, "muxer: fopen(%s) OK, prealloc %dMB",
+                 path, (int)(MUXER_PREALLOC_SIZE / (1024 * 1024)));
+    } else {
+        ESP_LOGW(TAG, "muxer: fopen(%s) OK, prealloc SKIPPED (fseek failed)", path);
+    }
+
+    s_muxer_write_end = 0;
     return f;
 }
 
 static int muxer_fwrite(void *writer, void *buffer, int len)
 {
-    size_t written = fwrite(buffer, 1, len, (FILE *)writer);
+    FILE *f = (FILE *)writer;
+    size_t written = fwrite(buffer, 1, len, f);
     if (written != (size_t)len) {
         ESP_LOGE(TAG, "muxer: fwrite(%d) only wrote %d bytes", len, (int)written);
         return -1;
+    }
+    /* 跟踪实际数据尾部 (当前 position = 上次写入结束位置) */
+    long cur_end = ftell(f);
+    if (cur_end > s_muxer_write_end) {
+        s_muxer_write_end = cur_end;
     }
     return len;
 }
 
 static int muxer_fseek(void *writer, uint64_t pos)
 {
-    return fseek((FILE *)writer, (long)pos, SEEK_SET);  // 0 = OK
+    return fseek((FILE *)writer, (long)pos, SEEK_SET);
 }
 
 static int muxer_fclose(void *writer)
 {
     FILE *f = (FILE *)writer;
     fflush(f);
+    /* 截断到实际数据大小: 预分配时文件被撑到 16MB, 需裁掉尾部空洞 */
+    if (s_muxer_write_end > 0) {
+        ftruncate(fileno(f), s_muxer_write_end);
+    }
     fsync(fileno(f));
     int ret = fclose(f);
-    ESP_LOGI(TAG, "muxer: fclose ret=%d", ret);
+    ESP_LOGI(TAG, "muxer: fclose ret=%d, final_size=%ld", ret, s_muxer_write_end);
+    s_muxer_write_end = 0;
     return ret;
 }
 
@@ -411,8 +442,18 @@ static esp_muxer_file_writer_t s_muxer_writer = {
     .on_close = muxer_fclose,
 };
 
+// url_pattern 简单回调：向 muxer 提供文件路径（无 ctx）
+static int muxer_url_pattern_cb(char *file_path, int len, int slice_idx)
+{
+    if (!s_cur_muxer_mgr) return -1;
+    strncpy(file_path, s_cur_muxer_mgr->current_video_file.full_path, len - 1);
+    file_path[len - 1] = '\0';
+    ESP_LOGI(TAG, "muxer: url_pattern path=%s len=%d slice=%d", file_path, len, slice_idx);
+    return 0;
+}
+
 // url_pattern_ex 回调：向 muxer 提供文件路径
-static int muxer_url_pattern_cb(esp_muxer_slice_info_t *info, void *ctx)
+static int muxer_url_pattern_ex_cb(esp_muxer_slice_info_t *info, void *ctx)
 {
     storage_manager_t *manager = (storage_manager_t *)ctx;
     strncpy(info->file_path, manager->current_video_file.full_path, info->len - 1);
@@ -538,14 +579,16 @@ esp_err_t storage_manager_create_video_file(
              sizeof(manager->current_video_file.metadata.create_time),
              "%Y-%m-%dT%H:%M:%S", &timeinfo);
 
-    // 配置 MP4 muxer（文件 I/O 由 muxer 内部通过 url_pattern_ex 回调管理）
+    // 配置 MP4 muxer（同时设置 url_pattern 和 url_pattern_ex，兼容不同库版本）
+    s_cur_muxer_mgr = manager;
     mp4_muxer_config_t muxer_cfg = {
         .base_config = {
             .muxer_type          = ESP_MUXER_TYPE_MP4,
             .slice_duration      = ESP_MUXER_MAX_SLICE_DURATION,
-            .url_pattern_ex      = muxer_url_pattern_cb,
+            .url_pattern         = muxer_url_pattern_cb,
+            .url_pattern_ex      = muxer_url_pattern_ex_cb,
             .ctx                 = manager,
-            .ram_cache_size      = 32 * 1024,  // muxer 内部 DMA 友好缓存 (官方推荐 ≥16KB)
+            .ram_cache_size      = 512 * 1024,
             .no_key_frame_verify = true,
         },
         .display_in_order  = true,
@@ -556,9 +599,15 @@ esp_err_t storage_manager_create_video_file(
         (esp_muxer_config_t *)&muxer_cfg, sizeof(muxer_cfg));
     if (!manager->current_video_file.muxer) {
         ESP_LOGE(TAG, "Failed to open MP4 muxer for: %s", fullpath);
+        s_cur_muxer_mgr = NULL;
         xSemaphoreGive(manager->lock);
         return ESP_FAIL;
     }
+
+    /* 安装自定义文件写入器, 增强错误诊断 */
+    esp_muxer_set_file_writer(manager->current_video_file.muxer, &s_muxer_writer);
+
+    /* s_cur_muxer_mgr 保持有效直到 muxer 关闭 */
 
     ESP_LOGI(TAG, "Created video file: %s", fullpath);
 
@@ -701,6 +750,7 @@ esp_err_t storage_manager_close_video_file(
         esp_muxer_close(manager->current_video_file.muxer);
         manager->current_video_file.muxer = NULL;
         manager->current_video_file.stream_added = false;
+        s_cur_muxer_mgr = NULL;
     }
 
     // 获取文件大小
@@ -1219,6 +1269,7 @@ esp_err_t storage_manager_deinit(storage_manager_handle_t handle)
         esp_muxer_close(manager->current_video_file.muxer);
         manager->current_video_file.muxer = NULL;
         manager->current_video_file.stream_added = false;
+        s_cur_muxer_mgr = NULL;
     }
 
     // 卸载文件系统 / 释放硬件
