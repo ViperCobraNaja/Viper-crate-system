@@ -31,6 +31,7 @@
 #include <linux/videodev2.h>
 #include "driver/ppa.h"
 #include "esp_private/esp_cache_private.h"
+#include "esp_cache.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_h264_enc_param_hw.h"
 #include "esp_h264_alloc.h"
@@ -38,8 +39,20 @@
 #include "motion_detector.h"
 #include "video_recorder.h"
 #include "storage_manager.h"
+#include "esp_imgfx_color_convert.h"
+#include "esp_imgfx_types.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 #define ALIGN_UP(num, align)    (((num) + ((align) - 1)) & ~((align) - 1))
+
+/* 异步 SD 写入 —— 解耦编码 pipeline 与 SD 卡写入延迟 */
+#define ASYNC_WRITE_BUF_COUNT 3
+#define ASYNC_WRITE_BUF_SIZE  (1536 * 1024)  /* 1.5MB 足够最大 IDR 帧 */
+
+/* 颜色转换方案: 1=ESP_IMGFX汇编优化, 0=CPU软件转换 */
+#define USE_ESP_IMGFX 1
 
 /* ========================================================================== */
 /* 系统状态                                                                  */
@@ -103,8 +116,6 @@ static ppa_client_handle_t g_ppa_encode = NULL;    /* 编码用 (RGB/YUV→YUV) 
 
 /* 缓冲区 */
 static uint8_t  *g_lcd_rgb_buf = NULL;     /* RGB565 LCD 画布 */
-static uint8_t  *g_enc_yuv_buf = NULL;     /* PPA 输出的 YUV420 I420 */
-static size_t    g_enc_yuv_buf_size = 0;
 
 /* 管理器句柄 */
 static storage_manager_handle_t g_storage = NULL;
@@ -125,15 +136,296 @@ static bool        g_has_pending_switch = false;
 /* 自动测试录像标志（绕过 video_recorder 状态机检查） */
 static bool g_auto_recording = false;
 
+/* ========================================================================== */
+/* 异步 SD 写入 —— 解耦 pipeline 与 SD 延迟                                  */
+/* ========================================================================== */
+
+typedef struct {
+    size_t    len;
+    uint64_t  timestamp;
+    bool      is_keyframe;
+    char      filename[64];
+    uint8_t  *pool_buf;        /* PSRAM heap, ASYNC_WRITE_BUF_SIZE */
+} async_write_job_t;
+
+static async_write_job_t g_async_jobs[ASYNC_WRITE_BUF_COUNT];
+static QueueHandle_t     g_async_free_queue = NULL;   /* 空闲 buffer 索引队列 */
+static QueueHandle_t     g_async_ready_queue = NULL;  /* 就绪待写 buffer 索引队列 */
+static TaskHandle_t      g_async_writer_task = NULL;
+
+static void async_sd_writer_task(void *arg)
+{
+    int idx;
+    while (1) {
+        if (xQueueReceive(g_async_ready_queue, &idx, portMAX_DELAY) == pdTRUE) {
+            async_write_job_t *job = &g_async_jobs[idx];
+            storage_manager_write_video_frame(
+                g_storage, job->filename,
+                job->pool_buf, job->len,
+                job->timestamp, job->is_keyframe);
+            /* 写完后归还 buffer 到空闲队列 */
+            xQueueSend(g_async_free_queue, &idx, 0);
+        }
+    }
+}
+
+/* ========================================================================== */
+/* 帧队列流水线: 相机回调 → 帧池 → 编码处理 task → SD 写入 task                */
+/* ========================================================================== */
+
+#define FRAME_POOL_COUNT 5
+#define FRAME_POOL_SIZE   ALIGN_UP(CAM_WIDTH * CAM_HEIGHT * 3 / 2, 64)
+
+typedef struct {
+    uint8_t  *i420_data;   /* 帧池中 I420 数据指针 */
+    int       pool_idx;     /* 帧池索引 */
+    uint32_t  enc_w, enc_h;
+    uint32_t  timestamp;
+    bool      do_display;
+    ppa_srm_color_mode_t     in_cm;
+    ppa_srm_rotation_angle_t rotation;
+} frame_job_t;
+
+static uint8_t     *g_frame_pool[FRAME_POOL_COUNT];
+static QueueHandle_t g_frame_free_queue  = NULL;
+static QueueHandle_t g_frame_ready_queue = NULL;
+static TaskHandle_t  g_encode_task = NULL;
+
+/* 处理 task 局部帧计数器（用于启动自动录像等逻辑） */
+static int g_encode_frame_count = 0;
+
+#if USE_ESP_IMGFX
+/* ESP_IMGFX 颜色转换: I420 → NV12 (汇编优化路径, 需要 cached 输入) */
+static esp_imgfx_color_convert_handle_t g_cc_handle = NULL;
+static uint32_t g_cc_enc_w = 0;
+static uint32_t g_cc_enc_h = 0;
+#endif
+
+/* 前向声明 —— 函数定义在文件后面 */
+static esp_err_t ppa_display_process(uint8_t *in_buf, ppa_srm_color_mode_t in_cm,
+                                      uint32_t in_w, uint32_t in_h,
+                                      uint8_t *rgb_out, uint32_t out_w, uint32_t out_h,
+                                      size_t out_buf_size, ppa_srm_rotation_angle_t rotation);
+static esp_err_t switch_state(sys_state_t new_state);
+static esp_err_t stop_recording(void);
+
+static void encode_processor_task(void *arg)
+{
+    frame_job_t job;
+    while (1) {
+        if (xQueueReceive(g_frame_ready_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+
+        g_encode_frame_count++;
+        int64_t t_proc_start = esp_timer_get_time();
+
+        /* ---- 0. 延迟状态切换 ---- */
+        if (g_has_pending_switch) {
+            g_has_pending_switch = false;
+            switch_state(g_pending_state);
+
+            if (g_state == SYS_STATE_RECORDING) {
+                uint32_t ts = esp_timer_get_time() / 1000000;
+                snprintf(g_current_filename, sizeof(g_current_filename),
+                         "VID_%08" PRIu32 ".mp4", ts);
+                esp_err_t ret = storage_manager_create_video_file(
+                    g_storage, g_current_filename,
+                    CAM_WIDTH, CAM_HEIGHT, record_enc_cfg.fps, record_enc_cfg.rc.bitrate);
+                if (ret == ESP_OK) {
+                    g_file_open = true;
+                    ESP_LOGI(TAG, "Recording START: %s", g_current_filename);
+                }
+            }
+        }
+
+        /* ---- 自动测试录像 ---- */
+        if (g_encode_frame_count == 20 && g_state == SYS_STATE_MONITOR && g_recorder) {
+            ESP_LOGI(TAG, ">>> Startup auto-record triggered <<<");
+            g_auto_recording = true;
+            g_pending_state = SYS_STATE_RECORDING;
+            g_has_pending_switch = true;
+        } else if (g_encode_frame_count >= 80 && g_encode_frame_count < 81 &&
+                   g_state == SYS_STATE_RECORDING) {
+            ESP_LOGI(TAG, ">>> Stopping auto-record <<<");
+            g_auto_recording = false;
+            stop_recording();
+            g_pending_state = SYS_STATE_MONITOR;
+            g_has_pending_switch = true;
+        }
+
+        /* ---- 1. PPA 显示 (每 N 帧) ---- */
+        if (job.do_display) {
+            bsp_display_lock(0);
+            ppa_display_process(job.i420_data, job.in_cm,
+                                job.enc_w, job.enc_h,
+                                g_lcd_rgb_buf,
+                                BSP_LCD_H_RES, BSP_LCD_V_RES,
+                                BSP_LCD_H_RES * BSP_LCD_V_RES * 2,
+                                job.rotation);
+            lv_canvas_set_buffer(g_camera_canvas, g_lcd_rgb_buf,
+                                 BSP_LCD_H_RES, BSP_LCD_V_RES, LV_COLOR_FORMAT_RGB565);
+            lv_obj_center(g_camera_canvas);
+            lv_obj_invalidate(g_camera_canvas);
+            bsp_display_unlock();
+        }
+        int64_t t_ppa_disp = esp_timer_get_time();
+
+        /* ---- 2. I420 → NV12 (ESP_IMGFX) ---- */
+#if USE_ESP_IMGFX
+        if (job.enc_w != g_cc_enc_w || job.enc_h != g_cc_enc_h) {
+            esp_imgfx_color_convert_cfg_t cc_cfg;
+            esp_imgfx_color_convert_get_cfg(g_cc_handle, &cc_cfg);
+            cc_cfg.in_res.width = job.enc_w;
+            cc_cfg.in_res.height = job.enc_h;
+            esp_imgfx_color_convert_set_cfg(g_cc_handle, &cc_cfg);
+            g_cc_enc_w = job.enc_w;
+            g_cc_enc_h = job.enc_h;
+        }
+        {
+            uint32_t in_size = job.enc_w * job.enc_h * 3 / 2;
+            uint32_t out_size = ALIGN_UP(job.enc_w, 16) * ALIGN_UP(job.enc_h, 16) * 3 / 2;
+            esp_imgfx_data_t in_data = {.data = job.i420_data, .data_len = in_size};
+            esp_imgfx_data_t out_data = {.data = g_enc_nv12_buf, .data_len = out_size};
+            esp_imgfx_err_t imgfx_ret = esp_imgfx_color_convert_process(g_cc_handle, &in_data, &out_data);
+            if (imgfx_ret != ESP_IMGFX_ERR_OK) {
+                ESP_LOGW(TAG, "ESP_IMGFX convert failed: %d", imgfx_ret);
+                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
+                continue;
+            }
+        }
+#else
+        i420_to_nv12(job.i420_data, g_enc_nv12_buf, job.enc_w, job.enc_h);
+#endif
+        int64_t t_i420nv12 = esp_timer_get_time();
+
+        /* ---- 3. H.264 硬件编码 ---- */
+        esp_h264_enc_in_frame_t in_frame = {
+            .raw_data.buffer = g_enc_nv12_buf,
+            .raw_data.len    = g_enc_nv12_buf_size,
+            .pts             = job.timestamp,
+        };
+        esp_h264_enc_out_frame_t out_frame = {
+            .raw_data.buffer = g_enc_out_buf,
+            .raw_data.len    = g_enc_out_buf_size,
+        };
+
+        esp_h264_enc_hw_set_mv_pkt(g_h264_param, g_mv_pkt);
+        esp_h264_err_t h264_ret = esp_h264_enc_process(g_h264_enc, &in_frame, &out_frame);
+        if (h264_ret != ESP_H264_ERR_OK) {
+            ESP_LOGW(TAG, "H.264 encode failed: %d", h264_ret);
+            xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
+            continue;
+        }
+        int64_t t_h264 = esp_timer_get_time();
+
+        /* ---- 4. 提取硬件运动矢量 ---- */
+        uint32_t mv_len = 0;
+        esp_h264_enc_hw_get_mv_data_len(g_h264_param, &mv_len);
+
+        static int debug_counter = 0;
+        if (++debug_counter % 50 == 0) {
+            video_record_state_t dbg_vr_state = RECORD_STATE_IDLE;
+            if (g_recorder) {
+                video_recorder_get_status(g_recorder, &dbg_vr_state, NULL, NULL);
+            }
+            const char *vr_str[] = {"IDLE","PRE_REC","REC","POST_REC","WRITE","ERR"};
+
+            if (mv_len > 0) {
+                uint32_t max_motion = 0, total_motion = 0;
+                const esp_h264_enc_mv_data_t *mvs = (const esp_h264_enc_mv_data_t *)g_mv_pkt.data;
+                for (uint32_t j = 0; j < mv_len; j++) {
+                    uint32_t m = abs(mvs[j].mv_x) + abs(mvs[j].mv_y);
+                    if (m > max_motion) max_motion = m;
+                    total_motion += m;
+                }
+                ESP_LOGI(TAG, "MV:%" PRIu32 " max=%" PRIu32 " avg=%.1f | rec:%s file:%s",
+                         mv_len, max_motion,
+                         mv_len > 0 ? (float)total_motion / mv_len : 0.0f,
+                         vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
+                         g_file_open ? "OPEN" : "-");
+            } else {
+                ESP_LOGW(TAG, "MV:0 (no data!) | rec:%s file:%s",
+                         vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
+                         g_file_open ? "OPEN" : "-");
+            }
+        }
+
+        if (mv_len > 0 && g_recorder) {
+            video_recorder_process_hw_motion_vectors(
+                g_recorder, (const uint32_t *)g_mv_pkt.data,
+                mv_len, job.enc_w, job.enc_h, job.timestamp);
+
+            video_record_state_t vr_state;
+            video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
+
+            if (vr_state == RECORD_STATE_RECORDING && g_state == SYS_STATE_MONITOR) {
+                ESP_LOGI(TAG, ">>> Motion trigger → switching to RECORD <<<");
+                g_pending_state = SYS_STATE_RECORDING;
+                g_has_pending_switch = true;
+            }
+        }
+
+        /* 检查录像停止条件 */
+        if (g_state == SYS_STATE_RECORDING && g_file_open && g_recorder && !g_auto_recording) {
+            video_record_state_t vr_state;
+            video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
+            if (vr_state == RECORD_STATE_IDLE) {
+                stop_recording();
+                g_pending_state = SYS_STATE_MONITOR;
+                g_has_pending_switch = true;
+            }
+        }
+
+        int64_t t_mv_proc = esp_timer_get_time();
+
+        /* ---- 5. 录像态：异步写入 SD 卡 ---- */
+        if (g_state == SYS_STATE_RECORDING && g_file_open && out_frame.length > 0) {
+            bool is_keyframe = (out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR ||
+                                out_frame.frame_type == ESP_H264_FRAME_TYPE_I);
+            int idx;
+            if (xQueueReceive(g_async_free_queue, &idx, 0) == pdTRUE) {
+                async_write_job_t *wjob = &g_async_jobs[idx];
+                memcpy(wjob->pool_buf, out_frame.raw_data.buffer, out_frame.length);
+                wjob->len = out_frame.length;
+                wjob->timestamp = job.timestamp;
+                wjob->is_keyframe = is_keyframe;
+                strncpy(wjob->filename, g_current_filename, sizeof(wjob->filename));
+                wjob->filename[sizeof(wjob->filename) - 1] = '\0';
+                xQueueSend(g_async_ready_queue, &idx, 0);
+            }
+        }
+
+        int64_t t_sd = esp_timer_get_time();
+
+        /* ---- 逐操作耗时 (每 30 帧输出) ---- */
+        static int perf_counter = 0;
+        if (++perf_counter % 30 == 0) {
+            int64_t total = t_sd - t_proc_start;
+            ESP_LOGI(TAG, "⏱ perf: total=%lldms | ppa_disp=%lld i420=%lld h264=%lld mv_proc=%lld sd_queue=%lld",
+                     total / 1000,
+                     (t_ppa_disp - t_proc_start) / 1000,
+                     (t_i420nv12 - t_ppa_disp) / 1000,
+                     (t_h264 - t_i420nv12) / 1000,
+                     (t_mv_proc - t_h264) / 1000,
+                     (t_sd - t_mv_proc) / 1000);
+        }
+
+        /* 归还帧缓冲到池 */
+        xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
+    }
+}
+
 /* 帧率统计 */
 static int64_t g_fps_last_time = 0;
 static int     g_fps_frame_count = 0;
 static int     g_fps_display_count = 0;
+static int     g_display_skip_count = 0;   /* 选择性显示计数器 */
+#define DISPLAY_EVERY_N  3  /* 每N帧显示1次 */
 
 /* ========================================================================== */
-/* 色彩格式转换: I420 → NV12 (O_UYY_E_VYY)                                   */
+/* 色彩格式转换: I420 → NV12 (O_UYY_E_VYY) — CPU 软件版本                      */
 /* ========================================================================== */
 
+#if !USE_ESP_IMGFX
 static void i420_to_nv12(const uint8_t *i420, uint8_t *nv12,
                          uint32_t width, uint32_t height)
 {
@@ -146,11 +438,23 @@ static void i420_to_nv12(const uint8_t *i420, uint8_t *nv12,
     const uint8_t *v_plane = i420 + y_size + uv_size;
     uint8_t *uv_dst = nv12 + y_size;
 
-    for (uint32_t i = 0; i < uv_size; i++) {
+    /* 以32字节块读写，利用PSRAM突发带宽 */
+    uint32_t block_count = uv_size / 32;
+    uint32_t rem = uv_size % 32;
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        uint32_t off = i * 32;
+        for (int j = 0; j < 32; j++) {
+            uv_dst[(off + j) * 2]     = u_plane[off + j];
+            uv_dst[(off + j) * 2 + 1] = v_plane[off + j];
+        }
+    }
+    for (uint32_t i = block_count * 32; i < uv_size; i++) {
         uv_dst[i * 2]     = u_plane[i];
         uv_dst[i * 2 + 1] = v_plane[i];
     }
 }
+#endif
 
 /* ========================================================================== */
 /* PPA 初始化与操作                                                          */
@@ -244,6 +548,47 @@ static esp_err_t ppa_encode_scale(
         .mode              = PPA_TRANS_MODE_BLOCKING,
     };
     return ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+}
+
+/**
+ * @brief PPA: YUV420→YUV420 1:1 硬件 DMA 拷贝 (绕过 CPU uncached 读瓶颈)
+ *
+ * PPA 用内部 DMA 从 uncached camera buffer 高效读取，写入 cached PSRAM 目标，
+ * CPU 后续从 cached 目标读取即可获得全速。~10ms vs CPU memcpy 84ms。
+ */
+static esp_err_t ppa_yuv_copy(uint8_t *in_buf, uint32_t w, uint32_t h,
+                               uint8_t *yuv_out, size_t out_buf_size)
+{
+    ppa_srm_oper_config_t cfg = {
+        .in.buffer         = in_buf,
+        .in.pic_w          = w,
+        .in.pic_h          = h,
+        .in.block_w        = w,
+        .in.block_h        = h,
+        .in.block_offset_x = 0,
+        .in.block_offset_y = 0,
+        .in.srm_cm         = PPA_SRM_COLOR_MODE_YUV420,
+        .out.buffer        = yuv_out,
+        .out.buffer_size   = out_buf_size,
+        .out.pic_w         = w,
+        .out.pic_h         = h,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm        = PPA_SRM_COLOR_MODE_YUV420,
+        .rotation_angle    = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x           = 1.0f,
+        .scale_y           = 1.0f,
+        .rgb_swap          = 0,
+        .byte_swap         = 0,
+        .mode              = PPA_TRANS_MODE_BLOCKING,
+    };
+    esp_err_t ret = ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+    if (ret == ESP_OK) {
+        /* PPA DMA 写入后需使 CPU cache 无效，确保 CPU 读取到最新数据 */
+        esp_cache_msync(yuv_out, out_buf_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    }
+    return ret;
 }
 
 /* ========================================================================== */
@@ -421,16 +766,16 @@ static void camera_frame_cb(
     uint8_t *camera_buf, uint8_t camera_buf_index,
     uint32_t camera_buf_hes, uint32_t camera_buf_ves, size_t camera_buf_len)
 {
-    uint32_t timestamp = esp_timer_get_time() / 1000;
+    int64_t t_start = esp_timer_get_time();
+    uint32_t timestamp = t_start / 1000;
 
     /* ---- 帧率统计 ---- */
     g_fps_frame_count++;
     g_fps_display_count++;
-    int64_t now = esp_timer_get_time();
-    if (now - g_fps_last_time >= 5000000) {  /* 每 5 秒输出 */
-        float fps = g_fps_frame_count * 1000000.0f / (now - g_fps_last_time);
+    int64_t now = t_start;
+    if (now - g_fps_last_time >= 5000000) {
         float disp_fps = g_fps_display_count * 1000000.0f / (now - g_fps_last_time);
-        ESP_LOGI(TAG, "FPS: %.1f (disp), state=%s, fmt=%s",
+        ESP_LOGI(TAG, "FPS: %.1f (capture), state=%s, fmt=%s",
                  disp_fps,
                  g_state == SYS_STATE_MONITOR ? "MON" : "REC",
                  g_camera_fmt == APP_VIDEO_FMT_YUV420 ? "YUV420" : "RGB565");
@@ -439,53 +784,14 @@ static void camera_frame_cb(
         g_fps_last_time = now;
     }
 
-    /* 启动自动测试录像 */
-    static int startup_frame_count = 0;
-    if (startup_frame_count == 0) {
-        startup_frame_count = 1;
-    } else if (startup_frame_count == 20 && g_state == SYS_STATE_MONITOR && g_recorder) {
-        ESP_LOGI(TAG, ">>> Startup auto-record triggered <<<");
-        g_auto_recording = true;
-        g_pending_state = SYS_STATE_RECORDING;
-        g_has_pending_switch = true;
-    } else if (startup_frame_count >= 80 && startup_frame_count < 81 &&
-               g_state == SYS_STATE_RECORDING) {
-        ESP_LOGI(TAG, ">>> Stopping auto-record <<<");
-        g_auto_recording = false;
-        stop_recording();
-        g_pending_state = SYS_STATE_MONITOR;
-        g_has_pending_switch = true;
-    }
-    if (startup_frame_count > 0 && startup_frame_count < 200) {
-        startup_frame_count++;
-    }
+    /* ---- 分辨率 ---- */
+    uint32_t enc_w = (g_state == SYS_STATE_MONITOR) ? MON_WIDTH  : CAM_WIDTH;
+    uint32_t enc_h = (g_state == SYS_STATE_MONITOR) ? MON_HEIGHT : CAM_HEIGHT;
 
-    /* ---- 0. 延迟状态切换 ---- */
-    if (g_has_pending_switch) {
-        g_has_pending_switch = false;
-        switch_state(g_pending_state);
-
-        if (g_state == SYS_STATE_RECORDING) {
-            uint32_t ts = esp_timer_get_time() / 1000000;
-            snprintf(g_current_filename, sizeof(g_current_filename),
-                     "VID_%08" PRIu32 ".mp4", ts);
-
-            esp_err_t ret = storage_manager_create_video_file(
-                g_storage, g_current_filename,
-                CAM_WIDTH, CAM_HEIGHT, record_enc_cfg.fps, record_enc_cfg.rc.bitrate);
-
-            if (ret == ESP_OK) {
-                g_file_open = true;
-                ESP_LOGI(TAG, "Recording START: %s", g_current_filename);
-            }
-        }
-    }
-
-    /* 摄像头为 YUV420 时的输入色彩模式 */
+    /* ---- 颜色模式和旋转 ---- */
     ppa_srm_color_mode_t in_cm = (g_camera_fmt == APP_VIDEO_FMT_YUV420)
                                  ? PPA_SRM_COLOR_MODE_YUV420
                                  : PPA_SRM_COLOR_MODE_RGB565;
-
     ppa_srm_rotation_angle_t rotation = PPA_SRM_ROTATION_ANGLE_0;
     switch (BSP_CAMERA_ROTATION) {
     case 90:  rotation = PPA_SRM_ROTATION_ANGLE_90;  break;
@@ -494,148 +800,52 @@ static void camera_frame_cb(
     default:  break;
     }
 
-    /* ---- 1. PPA: 显示路径 (→ RGB565 1024x600) ---- */
-    bsp_display_lock(0);
-    ppa_display_process(camera_buf, in_cm,
-                        camera_buf_hes, camera_buf_ves,
-                        g_lcd_rgb_buf, BSP_LCD_H_RES, BSP_LCD_V_RES,
-                        BSP_LCD_H_RES * BSP_LCD_V_RES * 2, rotation);
-    lv_canvas_set_buffer(g_camera_canvas, g_lcd_rgb_buf,
-                         BSP_LCD_H_RES, BSP_LCD_V_RES, LV_COLOR_FORMAT_RGB565);
-    lv_obj_center(g_camera_canvas);
-    lv_obj_invalidate(g_camera_canvas);
-    bsp_display_unlock();
-
-    /* ---- 2. 编码路径 ---- */
-    uint32_t enc_w, enc_h;
-    if (g_state == SYS_STATE_MONITOR) {
-        enc_w = MON_WIDTH;
-        enc_h = MON_HEIGHT;
-    } else {
-        enc_w = CAM_WIDTH;
-        enc_h = CAM_HEIGHT;
-    }
-
-    const uint8_t *i420_src;
-    if (g_camera_fmt == APP_VIDEO_FMT_YUV420) {
-        /* YUV420 摄像头: 直接使用摄像头缓冲区，仅需要缩放时过 PPA */
-        if (enc_w == camera_buf_hes && enc_h == camera_buf_ves) {
-            /* 录像模式: 同分辨率，直接转 NV12，无需 PPA */
-            i420_src = camera_buf;
-        } else {
-            /* 监控模式: 需要 YUV→YUV 缩放 */
-            ppa_encode_scale(camera_buf, PPA_SRM_COLOR_MODE_YUV420,
-                             camera_buf_hes, camera_buf_ves,
-                             g_enc_yuv_buf, enc_w, enc_h, g_enc_yuv_buf_size);
-            i420_src = g_enc_yuv_buf;
-        }
-    } else {
-        /* RGB565 摄像头: 需要 PPA RGB→YUV 色域转换 + 缩放 */
-        ppa_encode_scale(camera_buf, PPA_SRM_COLOR_MODE_RGB565,
-                         camera_buf_hes, camera_buf_ves,
-                         g_enc_yuv_buf, enc_w, enc_h, g_enc_yuv_buf_size);
-        i420_src = g_enc_yuv_buf;
-    }
-
-    /* ---- 3. I420 → NV12 ---- */
-    i420_to_nv12(i420_src, g_enc_nv12_buf, enc_w, enc_h);
-
-    /* ---- 4. H.264 硬件编码 ---- */
-    esp_h264_enc_in_frame_t in_frame = {
-        .raw_data.buffer = g_enc_nv12_buf,
-        .raw_data.len    = g_enc_nv12_buf_size,
-        .pts             = timestamp,
-    };
-    esp_h264_enc_out_frame_t out_frame = {
-        .raw_data.buffer = g_enc_out_buf,
-        .raw_data.len    = g_enc_out_buf_size,
-    };
-
-    esp_h264_enc_hw_set_mv_pkt(g_h264_param, g_mv_pkt);
-
-    esp_h264_err_t h264_ret = esp_h264_enc_process(g_h264_enc,
-                                                    &in_frame, &out_frame);
-    if (h264_ret != ESP_H264_ERR_OK) {
-        ESP_LOGW(TAG, "H.264 encode failed: %d", h264_ret);
+    /* ---- 从帧池获取空闲 buffer ---- */
+    int pool_idx;
+    if (xQueueReceive(g_frame_free_queue, &pool_idx, 0) != pdTRUE) {
+        /* 帧池耗尽 → 丢帧（编码 pipeline 落后于相机） */
         return;
     }
 
-    /* ---- 5. 提取硬件运动矢量 ---- */
-    uint32_t mv_len = 0;
-    esp_h264_enc_hw_get_mv_data_len(g_h264_param, &mv_len);
-
-    static int debug_counter = 0;
-    if (++debug_counter % 50 == 0) {
-        video_record_state_t dbg_vr_state = RECORD_STATE_IDLE;
-        if (g_recorder) {
-            video_recorder_get_status(g_recorder, &dbg_vr_state, NULL, NULL);
-        }
-        const char *vr_str[] = {"IDLE","PRE_REC","REC","POST_REC","WRITE","ERR"};
-
-        if (mv_len > 0) {
-            uint32_t max_motion = 0, total_motion = 0;
-            const esp_h264_enc_mv_data_t *mvs = (const esp_h264_enc_mv_data_t *)g_mv_pkt.data;
-            for (uint32_t j = 0; j < mv_len; j++) {
-                uint32_t m = abs(mvs[j].mv_x) + abs(mvs[j].mv_y);
-                if (m > max_motion) max_motion = m;
-                total_motion += m;
-            }
-            ESP_LOGI(TAG, "MV:%" PRIu32 " max=%" PRIu32 " avg=%.1f | rec:%s file:%s",
-                     mv_len, max_motion,
-                     mv_len > 0 ? (float)total_motion / mv_len : 0.0f,
-                     vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
-                     g_file_open ? "OPEN" : "-");
+    /* ---- PPA DMA: camera (uncached) → 帧池 buffer (cached) ---- */
+    uint8_t *dst = g_frame_pool[pool_idx];
+    if (g_camera_fmt == APP_VIDEO_FMT_YUV420) {
+        if (enc_w == camera_buf_hes && enc_h == camera_buf_ves) {
+            ppa_yuv_copy(camera_buf, enc_w, enc_h, dst, enc_w * enc_h * 3 / 2);
         } else {
-            ESP_LOGW(TAG, "MV:0 (no data!) | rec:%s file:%s",
-                     vr_str[dbg_vr_state <= RECORD_STATE_ERROR ? dbg_vr_state : 0],
-                     g_file_open ? "OPEN" : "-");
+            ppa_encode_scale(camera_buf, PPA_SRM_COLOR_MODE_YUV420,
+                             camera_buf_hes, camera_buf_ves,
+                             dst, enc_w, enc_h, enc_w * enc_h * 3 / 2);
         }
+    } else {
+        ppa_encode_scale(camera_buf, PPA_SRM_COLOR_MODE_RGB565,
+                         camera_buf_hes, camera_buf_ves,
+                         dst, enc_w, enc_h, enc_w * enc_h * 3 / 2);
     }
+    int64_t t_copy_done = esp_timer_get_time();
 
-    if (mv_len > 0) {
-        if (g_recorder) {
-            video_recorder_process_hw_motion_vectors(
-                g_recorder, (const uint32_t *)g_mv_pkt.data,
-                mv_len, enc_w, enc_h, timestamp);
+    /* ---- 本帧是否需要显示 ---- */
+    g_display_skip_count++;
+    bool do_disp = (g_display_skip_count % DISPLAY_EVERY_N == 0);
 
-            video_record_state_t vr_state;
-            video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
+    /* ---- 构建 job 推入编码队列 ---- */
+    frame_job_t job = {
+        .i420_data = dst,
+        .pool_idx  = pool_idx,
+        .enc_w     = enc_w,
+        .enc_h     = enc_h,
+        .timestamp = timestamp,
+        .do_display = do_disp,
+        .in_cm      = in_cm,
+        .rotation   = rotation,
+    };
+    xQueueSend(g_frame_ready_queue, &job, 0);
 
-            if (vr_state == RECORD_STATE_RECORDING &&
-                g_state == SYS_STATE_MONITOR) {
-                ESP_LOGI(TAG, ">>> Motion trigger → switching to RECORD <<<");
-                g_pending_state = SYS_STATE_RECORDING;
-                g_has_pending_switch = true;
-            }
-        }
-    }
-
-    /* 检查录像停止条件 */
-    if (g_state == SYS_STATE_RECORDING && g_file_open && g_recorder && !g_auto_recording) {
-        video_record_state_t vr_state;
-        video_recorder_get_status(g_recorder, &vr_state, NULL, NULL);
-
-        if (vr_state == RECORD_STATE_IDLE) {
-            stop_recording();
-            g_pending_state = SYS_STATE_MONITOR;
-            g_has_pending_switch = true;
-        }
-    }
-
-    /* ---- 6. 录像态：写入 SD 卡 ---- */
-    if (g_state == SYS_STATE_RECORDING && g_file_open && out_frame.length > 0) {
-        static int write_counter = 0;
-        write_counter++;
-        if (write_counter % 50 == 1) {
-            ESP_LOGI(TAG, "SD write: %s frame=%d size=%" PRIu32,
-                     g_current_filename, write_counter, out_frame.length);
-        }
-        bool is_keyframe = (out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR ||
-                            out_frame.frame_type == ESP_H264_FRAME_TYPE_I);
-        storage_manager_write_video_frame(
-            g_storage, g_current_filename,
-            out_frame.raw_data.buffer, out_frame.length,
-            timestamp, is_keyframe);
+    /* ---- 相机回调耗时 ---- */
+    static int cb_perf_counter = 0;
+    if (++cb_perf_counter % 30 == 0) {
+        int64_t cb_time = t_copy_done - t_start;
+        ESP_LOGI(TAG, "⏱ cam_cb: %lldms (copy to pool)", cb_time / 1000);
     }
 }
 
@@ -677,15 +887,25 @@ void app_main(void)
         return;
     }
 
-    g_enc_yuv_buf_size = ALIGN_UP(CAM_WIDTH * CAM_HEIGHT * 3 / 2,
-                                  g_cache_line_size);
-    g_enc_yuv_buf = heap_caps_aligned_calloc(g_cache_line_size, 1,
-                                              g_enc_yuv_buf_size,
-                                              MALLOC_CAP_SPIRAM);
-    if (!g_enc_yuv_buf) {
-        ESP_LOGE(TAG, "Failed to allocate encode YUV buffer");
-        return;
+    /* ---- 帧池: cached PSRAM 缓冲 (相机→PPA DMA→帧池→编码 task) ---- */
+    for (int i = 0; i < FRAME_POOL_COUNT; i++) {
+        g_frame_pool[i] = heap_caps_aligned_calloc(g_cache_line_size, 1,
+                                                    FRAME_POOL_SIZE,
+                                                    MALLOC_CAP_SPIRAM);
+        if (!g_frame_pool[i]) {
+            ESP_LOGE(TAG, "Failed to allocate frame pool buffer %d", i);
+            return;
+        }
     }
+    g_frame_free_queue = xQueueCreate(FRAME_POOL_COUNT, sizeof(int));
+    g_frame_ready_queue = xQueueCreate(FRAME_POOL_COUNT, sizeof(frame_job_t));
+    for (int i = 0; i < FRAME_POOL_COUNT; i++) {
+        xQueueSend(g_frame_free_queue, &i, 0);
+    }
+    ESP_LOGI(TAG, "Frame pool ready: %d x %uKB (total %uKB)",
+             FRAME_POOL_COUNT,
+             (unsigned)(FRAME_POOL_SIZE / 1024),
+             (unsigned)(FRAME_POOL_COUNT * FRAME_POOL_SIZE / 1024));
 
     /* ---- LVGL 画布 ---- */
     bsp_display_lock(0);
@@ -702,6 +922,26 @@ void app_main(void)
         return;
     }
     g_state = SYS_STATE_MONITOR;
+
+#if USE_ESP_IMGFX
+    /* ---- ESP_IMGFX 颜色转换引擎 (I420→NV12, 汇编优化) ---- */
+    {
+        esp_imgfx_color_convert_cfg_t cc_cfg = {
+            .in_res = {.width = CAM_WIDTH, .height = CAM_HEIGHT},
+            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_I420,
+            .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_O_UYY_E_VYY,
+            .color_space_std = ESP_IMGFX_COLOR_SPACE_STD_BT709,
+        };
+        esp_imgfx_err_t imgfx_ret = esp_imgfx_color_convert_open(&cc_cfg, &g_cc_handle);
+        if (imgfx_ret != ESP_IMGFX_ERR_OK) {
+            ESP_LOGE(TAG, "ESP_IMGFX open failed: %d", imgfx_ret);
+            return;
+        }
+        g_cc_enc_w = CAM_WIDTH;
+        g_cc_enc_h = CAM_HEIGHT;
+        ESP_LOGI(TAG, "ESP_IMGFX I420→NV12 ready (%dx%d, BT709)", CAM_WIDTH, CAM_HEIGHT);
+    }
+#endif
 
     /* ---- SD 卡存储管理器 ---- */
     storage_manager_config_t storage_cfg = {
@@ -720,6 +960,33 @@ void app_main(void)
     if (!g_storage) {
         ESP_LOGW(TAG, "SD card init failed, recording disabled");
     }
+
+    /* ---- 异步 SD 写入队列初始化 ---- */
+    if (g_storage) {
+        /* PSRAM heap alloc for async write buffers */
+        for (int i = 0; i < ASYNC_WRITE_BUF_COUNT; i++) {
+            g_async_jobs[i].pool_buf = heap_caps_aligned_calloc(
+                g_cache_line_size, 1, ASYNC_WRITE_BUF_SIZE, MALLOC_CAP_SPIRAM);
+            if (!g_async_jobs[i].pool_buf) {
+                ESP_LOGE(TAG, "Failed to alloc async write buffer %d", i);
+            }
+        }
+        g_async_free_queue = xQueueCreate(ASYNC_WRITE_BUF_COUNT, sizeof(int));
+        g_async_ready_queue = xQueueCreate(ASYNC_WRITE_BUF_COUNT, sizeof(int));
+        for (int i = 0; i < ASYNC_WRITE_BUF_COUNT; i++) {
+            int idx = i;
+            xQueueSend(g_async_free_queue, &idx, 0);
+        }
+        xTaskCreatePinnedToCore(async_sd_writer_task, "sd_writer",
+                                4096, NULL, 2, &g_async_writer_task, 1);
+        ESP_LOGI(TAG, "Async SD writer ready (%d x %dKB buffers, PSRAM)",
+                 ASYNC_WRITE_BUF_COUNT, ASYNC_WRITE_BUF_SIZE / 1024);
+    }
+
+    /* ---- 编码处理 task (从帧队列取帧: IMGFX + H264 + MV + 状态机) ---- */
+    xTaskCreatePinnedToCore(encode_processor_task, "encode_proc",
+                            8192, NULL, 5, &g_encode_task, 0);
+    ESP_LOGI(TAG, "Encode processor task started on core 0");
 
     /* ---- 录像器 ---- */
     video_record_config_t vr_cfg = {
@@ -822,6 +1089,9 @@ void app_main(void)
     /* 清理 */
     stop_recording();
     app_video_close(fd);
+#if USE_ESP_IMGFX
+    if (g_cc_handle) esp_imgfx_color_convert_close(g_cc_handle);
+#endif
     deinit_h264_encoder();
     if (g_recorder) video_recorder_deinit(g_recorder);
     if (g_storage) storage_manager_deinit(g_storage);

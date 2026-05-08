@@ -545,7 +545,7 @@ esp_err_t storage_manager_create_video_file(
             .slice_duration      = ESP_MUXER_MAX_SLICE_DURATION,
             .url_pattern_ex      = muxer_url_pattern_cb,
             .ctx                 = manager,
-            .ram_cache_size      = 0,    // 关闭内部缓存，直接用 fsync 落盘
+            .ram_cache_size      = 32 * 1024,  // muxer 内部 DMA 友好缓存 (官方推荐 ≥16KB)
             .no_key_frame_verify = true,
         },
         .display_in_order  = true,
@@ -559,9 +559,6 @@ esp_err_t storage_manager_create_video_file(
         xSemaphoreGive(manager->lock);
         return ESP_FAIL;
     }
-
-    // 注入自定义文件写入器（确保 fsync + 调试日志）
-    esp_muxer_set_file_writer(manager->current_video_file.muxer, &s_muxer_writer);
 
     ESP_LOGI(TAG, "Created video file: %s", fullpath);
 

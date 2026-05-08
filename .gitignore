@@ -10,4 +10,4 @@ sdkconfig.old
 # 编译器和 IDE 临时文件
 *.o
 *.d
-.vscode/
+.vscode/.claude/settings.local.json
