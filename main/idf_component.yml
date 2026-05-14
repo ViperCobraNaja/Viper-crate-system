@@ -2,4 +2,6 @@ dependencies:
   esp32_p4_function_ev_board:
     version: '*'
   espressif/esp_video: "~2.0"
-description: BSP Display and camera example
+  espressif/esp_wifi_remote: "^1.5.2"
+  espressif/esp_hosted: "*"
+description: PetWhisperer - BSP Display and camera with WiFi

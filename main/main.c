@@ -35,6 +35,7 @@
 #include "esp_h264_enc_single_hw.h"
 #include "esp_h264_enc_param_hw.h"
 #include "esp_h264_alloc.h"
+#include "wifi_manager.h"
 #include "app_video.h"
 #include "storage_manager.h"
 #include "esp_imgfx_color_convert.h"
@@ -52,31 +53,37 @@
 /* 颜色转换方案: 1=ESP_IMGFX汇编优化, 0=CPU软件转换 */
 #define USE_ESP_IMGFX 1
 
+/* 调试: 设为 1 用合成彩条替代前10帧NV12数据, 验证编码器输入格式 */
+#define DEBUG_SYNTHETIC_TEST 1
+
+/* 录像开关: 1=启用SD卡录像, 0=禁用 (运动检测不受影响) */
+#define RECORDING_ENABLED 0
+
 /* ========================================================================== */
 /* 系统状态                                                                  */
 /* ========================================================================== */
 
 typedef enum {
-    SYS_STATE_MONITOR,      /* 低分辨率监控，不录像 */
+    SYS_STATE_MONITOR,      /* 监控，不录像 (编码器同分辨率 800x800) */
     SYS_STATE_RECORDING,    /* 高分辨率录像 */
 } sys_state_t;
 
-/* 固定分辨率 —— 摄像头始终以录像分辨率运行 */
+/* 固定分辨率 —— MON 和 REC 统一为 800x800, MV 宏块数从 300 升到 2500 */
 #define CAM_WIDTH    800
 #define CAM_HEIGHT   800
-#define MON_WIDTH    320
-#define MON_HEIGHT   240
+#define MON_WIDTH    800
+#define MON_HEIGHT   800
 
 /* 摄像头 DMA 缓冲区数量 */
 #define CAM_BUF_NUM  4
 
-/* H.264 监控模式编码配置 (HW -> O_UYY_E_VYY / NV12) */
+/* H.264 监控模式编码配置 (800x800, 高 QP 抑制噪声利于 MV 检测) */
 static const esp_h264_enc_cfg_hw_t monitor_enc_cfg = {
     .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,
     .gop      = 10,
     .fps      = 10,
     .res      = { .width = MON_WIDTH, .height = MON_HEIGHT },
-    .rc       = { .bitrate = 256000, .qp_min = 24, .qp_max = 42 },
+    .rc       = { .bitrate = 500000, .qp_min = 30, .qp_max = 42 },
 };
 
 /* H.264 录像模式编码配置 */
@@ -187,13 +194,20 @@ static TaskHandle_t  g_encode_task = NULL;
 /* 处理 task 帧计数器 */
 static int g_encode_frame_count = 0;
 
-/* 简单 MV 运动检测 (基于 avg + MV 数量) */
-#define MOTION_TRIGGER_AVG         35
-#define MOTION_TRIGGER_MV_COUNT    200
-#define MOTION_TRIGGER_FRAMES      3
-#define MOTION_SUSTAIN_AVG         20
-#define MOTION_SUSTAIN_MV_COUNT    500
-#define RECORDING_CHECK_INTERVAL   5000000  /* 5 秒 */
+/* 两级 MV 运动检测:
+ *   弱噪声: mag < 4     → 丢弃
+ *   强信号: mag >= 6    → 用于 trigger/sustain 判决
+ *   800x800 噪声 ~1500 块 (mag 2-5), 手 ~200 强块 (mag 6+)
+ */
+#define MV_NOISE_THRESHOLD        4    /* mag < 4 丢弃 */
+#define MV_STRONG_THRESHOLD       6    /* mag >= 6 为强运动块 */
+#define MOTION_TRIGGER_STRONG     80   /* 强运动块数 > 80 触发 */
+#define MOTION_TRIGGER_AVG        25
+#define MOTION_TRIGGER_FRAMES      8
+#define MOTION_SUSTAIN_STRONG     40   /* 强运动块数 > 40 续录 */
+#define MOTION_SUSTAIN_MV_COUNT   300
+#define MOTION_SUSTAIN_AVG        15
+#define RECORDING_CHECK_INTERVAL  10000000  /* 10 秒 */
 
 static int     g_motion_trigger_count = 0;
 static int64_t g_last_motion_check_us = 0;
@@ -212,6 +226,9 @@ static esp_err_t ppa_display_process(uint8_t *in_buf, ppa_srm_color_mode_t in_cm
                                       size_t out_buf_size, ppa_srm_rotation_angle_t rotation);
 static esp_err_t switch_state(sys_state_t new_state);
 static esp_err_t stop_recording(void);
+#if DEBUG_SYNTHETIC_TEST
+static void fill_color_bars_nv12(uint8_t *nv12, uint32_t w, uint32_t h);
+#endif
 
 static void encode_processor_task(void *arg)
 {
@@ -221,21 +238,12 @@ static void encode_processor_task(void *arg)
 
         g_encode_frame_count++;
 
-        /* ---- -1. 帧尺寸校验: 丢弃与当前编码器分辨率不匹配的帧 ---- */
-        {
-            uint32_t cur_w = (g_state == SYS_STATE_MONITOR) ? MON_WIDTH : CAM_WIDTH;
-            uint32_t cur_h = (g_state == SYS_STATE_MONITOR) ? MON_HEIGHT : CAM_HEIGHT;
-            if (job.enc_w != cur_w || job.enc_h != cur_h) {
-                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
-                continue;
-            }
-        }
-
         int64_t t_proc_start = esp_timer_get_time();
 
         /* ---- 0. 延迟状态切换 ---- */
         if (g_has_pending_switch) {
             g_has_pending_switch = false;
+#if RECORDING_ENABLED
             bool state_changed = (g_pending_state != g_state);
             switch_state(g_pending_state);
 
@@ -254,11 +262,13 @@ static void encode_processor_task(void *arg)
                 }
             }
 
-            if (state_changed) {
-                /* 丢弃当前帧: 帧尺寸基于旧状态, 新编码器缓冲区尺寸不匹配会堆溢出 */
-                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
-                continue;
-            }
+            /* MON/REC 同分辨率 800x800, 无需丢帧; state_changed 仅标记位 */
+            (void)state_changed;
+#else
+            ESP_LOGI(TAG, "Motion triggered (recording disabled)");
+            g_last_motion_check_us = esp_timer_get_time();
+            g_motion_trigger_count = 0;
+#endif
         }
 
         /* ---- 1. PPA 显示 (每 N 帧) ---- */
@@ -294,6 +304,12 @@ static void encode_processor_task(void *arg)
             uint32_t out_size = ALIGN_UP(job.enc_w, 16) * ALIGN_UP(job.enc_h, 16) * 3 / 2;
             esp_imgfx_data_t in_data = {.data = job.i420_data, .data_len = in_size};
             esp_imgfx_data_t out_data = {.data = g_enc_nv12_buf, .data_len = out_size};
+
+            /* 先 M2C 清掉输出 buffer 旧缓存; IMGFX 内部可能用 DMA 直写 PSRAM,
+             * 若不清则后续 C2M 会把 CPU 脏缓存覆写到 PSRAM 破坏 DMA 结果 */
+            esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+
             esp_imgfx_err_t imgfx_ret = esp_imgfx_color_convert_process(g_cc_handle, &in_data, &out_data);
             if (imgfx_ret != ESP_IMGFX_ERR_OK) {
                 ESP_LOGW(TAG, "ESP_IMGFX convert failed: %d", imgfx_ret);
@@ -309,6 +325,39 @@ static void encode_processor_task(void *arg)
         /* CPU 写 NV12 后写回 cache，确保编码器 DMA 可见 */
         esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+
+        /* ---- DEBUG: dump 前5帧 NV12 到 SD 卡, 用于 PC 验证数据正确性 ---- */
+        {
+            static int dump_count = 0;
+            if (dump_count < 5 && g_storage) {
+                char path[64];
+                snprintf(path, sizeof(path), "/sdcard/dump_%d.nv12", dump_count);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    size_t written = fwrite(g_enc_nv12_buf, 1, g_enc_nv12_buf_size, f);
+                    fclose(f);
+                    ESP_LOGI(TAG, "DUMP %s: %u/%u bytes", path, (unsigned)written, (unsigned)g_enc_nv12_buf_size);
+                }
+                dump_count++;
+            }
+        }
+
+        /* ---- DEBUG: 前10帧用合成彩条替代真实NV12数据 ---- */
+#if DEBUG_SYNTHETIC_TEST
+        {
+            static int synth_count = 0;
+            if (synth_count < 10) {
+                fill_color_bars_nv12(g_enc_nv12_buf, job.enc_w, job.enc_h);
+                /* 合成数据是 CPU 写入的, 必须 C2M 刷到 PSRAM 才能被编码器 DMA 读到 */
+                esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
+                                ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+                if (synth_count == 0) {
+                    ESP_LOGI(TAG, "SYNTH: color bars injected (800x800 NV12)");
+                }
+                synth_count++;
+            }
+        }
+#endif
 
         /* ---- 3. H.264 硬件编码 ---- */
         esp_h264_enc_in_frame_t in_frame = {
@@ -335,64 +384,66 @@ static void encode_processor_task(void *arg)
             esp_cache_msync(g_enc_out_buf, g_enc_out_buf_size,
                             ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
         }
+        /* MV buffer: 编码器 DMA 写入 PSRAM, CPU cache 已过时, 必须 M2C 失效 */
+        esp_cache_msync(g_mv_pkt.data, g_mv_pkt.len,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
 
-        /* ---- 4. 提取硬件运动矢量并计算运动强度 ---- */
+        /* ---- 4. 两级 MV 分类: 弱噪声 vs 强运动 ---- */
         uint32_t mv_len = 0;
         esp_h264_enc_hw_get_mv_data_len(g_h264_param, &mv_len);
 
-        uint32_t max_motion = 0;
-        uint32_t avg_motion = 0;
+        uint32_t max_motion = 0, strong_mv = 0;
         if (mv_len > 0) {
-            uint32_t total_motion = 0;
             const esp_h264_enc_mv_data_t *mvs = (const esp_h264_enc_mv_data_t *)g_mv_pkt.data;
             for (uint32_t j = 0; j < mv_len; j++) {
-                uint32_t m = abs(mvs[j].mv_x) + abs(mvs[j].mv_y);
-                if (m > max_motion) max_motion = m;
-                total_motion += m;
+                uint32_t mag = (uint32_t)(abs(mvs[j].mv_x) + abs(mvs[j].mv_y));
+                if (mag < MV_NOISE_THRESHOLD) continue;      /* 丢弃弱噪声 */
+                if (mag > max_motion) max_motion = mag;
+                if (mag >= MV_STRONG_THRESHOLD) strong_mv++; /* 强运动块计数 */
             }
-            avg_motion = total_motion / mv_len;
 
             static int debug_counter = 0;
-            if (++debug_counter % 50 == 0) {
-                ESP_LOGI(TAG, "MV:%" PRIu32 " max=%" PRIu32 " avg=%" PRIu32 " | state=%s file:%s",
-                         mv_len, max_motion, avg_motion,
+            if (++debug_counter % 30 == 0) {
+                ESP_LOGI(TAG, "MV: raw=%" PRIu32 " strong=%" PRIu32 " max=%" PRIu32
+                         " | state=%s file:%s",
+                         mv_len, strong_mv, max_motion,
                          g_state == SYS_STATE_MONITOR ? "MON" : "REC",
                          g_file_open ? "OPEN" : "-");
             }
         }
 
-        /* ---- 5. MV 运动检测 + 录像触发 ---- */
-        if (mv_len > 0) {
-            if (g_state == SYS_STATE_MONITOR) {
-                if (avg_motion > MOTION_TRIGGER_AVG && mv_len > MOTION_TRIGGER_MV_COUNT) {
-                    g_motion_trigger_count++;
-                    if (g_motion_trigger_count >= MOTION_TRIGGER_FRAMES) {
-                        ESP_LOGI(TAG, ">>> Motion trigger (avg=%" PRIu32 " mv=%" PRIu32 " x%d) -> RECORD <<<",
-                                 avg_motion, mv_len, g_motion_trigger_count);
-                        g_motion_trigger_count = 0;
-                        g_pending_state = SYS_STATE_RECORDING;
-                        g_has_pending_switch = true;
-                    }
-                } else {
+        /* ---- 5. MV 运动检测 (基于强运动块数 strong_mv) ---- */
+        if (g_state == SYS_STATE_MONITOR) {
+            if (strong_mv > MOTION_TRIGGER_STRONG) {
+                g_motion_trigger_count++;
+                if (g_motion_trigger_count >= MOTION_TRIGGER_FRAMES) {
+                    ESP_LOGI(TAG, ">>> Motion trigger (raw=%" PRIu32 " strong=%" PRIu32
+                             " max=%" PRIu32 " x%d) -> RECORD <<<",
+                             mv_len, strong_mv, max_motion, g_motion_trigger_count);
                     g_motion_trigger_count = 0;
-                }
-            } else if (g_state == SYS_STATE_RECORDING) {
-                if (avg_motion > MOTION_SUSTAIN_AVG || mv_len > MOTION_SUSTAIN_MV_COUNT) {
-                    g_last_motion_check_us = esp_timer_get_time();
-                }
-                int64_t now = esp_timer_get_time();
-                if (now - g_last_motion_check_us >= RECORDING_CHECK_INTERVAL) {
-                    ESP_LOGI(TAG, ">>> No motion for 5s -> stopping <<<");
-                    stop_recording();
-                    g_pending_state = SYS_STATE_MONITOR;
+                    g_pending_state = SYS_STATE_RECORDING;
                     g_has_pending_switch = true;
                 }
+            } else {
+                g_motion_trigger_count = 0;
+            }
+        } else if (g_state == SYS_STATE_RECORDING) {
+            if (strong_mv > MOTION_SUSTAIN_STRONG) {
+                g_last_motion_check_us = esp_timer_get_time();
+            }
+            int64_t now = esp_timer_get_time();
+            if (now - g_last_motion_check_us >= RECORDING_CHECK_INTERVAL) {
+                ESP_LOGI(TAG, ">>> No motion for 10s -> stopping <<<");
+                stop_recording();
+                g_pending_state = SYS_STATE_MONITOR;
+                g_has_pending_switch = true;
             }
         }
 
         int64_t t_mv_proc = esp_timer_get_time();
 
         /* ---- 6. 录像态：异步写入 SD 卡 ---- */
+#if RECORDING_ENABLED
         if (g_state == SYS_STATE_RECORDING && g_file_open && out_frame.length > 0) {
             bool is_keyframe = (out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR ||
                                 out_frame.frame_type == ESP_H264_FRAME_TYPE_I);
@@ -408,6 +459,7 @@ static void encode_processor_task(void *arg)
                 xQueueSend(g_async_ready_queue, &idx, 0);
             }
         }
+#endif
 
         int64_t t_sd = esp_timer_get_time();
 
@@ -435,6 +487,40 @@ static int     g_fps_frame_count = 0;
 static int     g_fps_display_count = 0;
 static int     g_display_skip_count = 0;   /* 选择性显示计数器 */
 #define DISPLAY_EVERY_N  3  /* 每N帧显示1次 */
+
+#if DEBUG_SYNTHETIC_TEST
+/* 生成标准彩条 NV12 测试帧 (O_UYY_E_VYY):
+ *   竖条: 白→黄→青→绿→红 (各 160px @800w)
+ *   Y/U/V 值按 BT.601 全范围计算 */
+static void fill_color_bars_nv12(uint8_t *nv12, uint32_t w, uint32_t h)
+{
+    static const uint8_t bar_y[5] = {255, 226, 179, 150,  76};
+    static const uint8_t bar_u[5] = {128,   0, 171,  43,  85};
+    static const uint8_t bar_v[5] = {128, 149,   0,  21, 255};
+    uint32_t bar_w = w / 5;
+    uint32_t y_size = w * h;
+
+    /* Y 平面: 每行竖条填充 */
+    for (uint32_t row = 0; row < h; row++) {
+        for (uint32_t col = 0; col < w; col++) {
+            int bar = col / bar_w;
+            if (bar > 4) bar = 4;
+            nv12[row * w + col] = bar_y[bar];
+        }
+    }
+
+    /* UV 平面: NV12 交织 UV (2x2 子采样) */
+    uint8_t *uv = nv12 + y_size;
+    for (uint32_t row = 0; row < h / 2; row++) {
+        for (uint32_t col = 0; col < w / 2; col++) {
+            int bar = (col * 2) / bar_w;
+            if (bar > 4) bar = 4;
+            uv[(row * (w / 2) + col) * 2]     = bar_u[bar];
+            uv[(row * (w / 2) + col) * 2 + 1] = bar_v[bar];
+        }
+    }
+}
+#endif
 
 /* ========================================================================== */
 /* 色彩格式转换: I420 → NV12 (O_UYY_E_VYY) — CPU 软件版本                      */
@@ -562,7 +648,12 @@ static esp_err_t ppa_encode_scale(
         .byte_swap         = 0,
         .mode              = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+    esp_err_t ret = ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+    if (ret == ESP_OK) {
+        esp_cache_msync(yuv_out, out_buf_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    }
+    return ret;
 }
 
 /**
@@ -976,6 +1067,7 @@ void app_main(void)
     }
 
     /* ---- 异步 SD 写入队列初始化 ---- */
+#if RECORDING_ENABLED
     if (g_storage) {
         /* PSRAM heap alloc for async write buffers */
         for (int i = 0; i < ASYNC_WRITE_BUF_COUNT; i++) {
@@ -996,11 +1088,15 @@ void app_main(void)
         ESP_LOGI(TAG, "Async SD writer ready (%d x %dKB buffers, PSRAM)",
                  ASYNC_WRITE_BUF_COUNT, ASYNC_WRITE_BUF_SIZE / 1024);
     }
+#endif
 
     /* ---- 编码处理 task (从帧队列取帧: IMGFX + H264 + MV + 状态机) ---- */
     xTaskCreatePinnedToCore(encode_processor_task, "encode_proc",
                             8192, NULL, 5, &g_encode_task, 0);
     ESP_LOGI(TAG, "Encode processor task started on core 0");
+
+    /* ---- WiFi 配网启动 (非阻塞, SoftAP + HTTP server) ---- */
+    wifi_manager_init();
 
     /* ---- 打开摄像头：优先 YUV420，回退到 RGB565 ---- */
     video_fmt_t try_fmts[] = { APP_VIDEO_FMT_YUV420, APP_VIDEO_FMT_RGB565 };

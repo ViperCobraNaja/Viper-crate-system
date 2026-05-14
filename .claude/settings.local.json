@@ -21,7 +21,8 @@
       "Read(//mnt/**)",
       "Bash(ls -d /[cdefh]/**/esp-idf 2>/dev/null || ls -d /mnt/[cdefh]/**/esp-idf 2>/dev/null || echo \"not found\")",
       "Read(//d//**)",
-      "Bash(where idf.py)"
+      "Bash(where idf.py)",
+      "WebSearch"
     ]
   }
 }

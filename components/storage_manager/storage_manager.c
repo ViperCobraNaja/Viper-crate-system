@@ -367,35 +367,27 @@ esp_err_t storage_manager_get_stats(storage_manager_handle_t handle, storage_sta
 
 // ---- MP4 muxer 回调与辅助函数 ----
 
-/* 文件预分配: 避免 FAT32 簇链分配在写入时触发 "三轮一次" */
+/* 文件预分配大小 (通过 esp_vfs_fat_create_contiguous_file 实现) */
 #define MUXER_PREALLOC_SIZE  (64 * 1024 * 1024)   /* 64MB, ~4分钟 2Mbps 录像 */
 
 static long s_muxer_write_end = 0;  /* 跟踪实际数据尾部, 用于 fclose 截断 */
 
-/* 自定义文件写入器, 含预分配 + 大缓冲 + fsync */
+/* 自定义文件写入器. 预分配由 storage_manager_create_video_file 调用
+ * esp_vfs_fat_create_contiguous_file 完成, 此处只负责打开已有文件 */
 static void *muxer_fopen(char *path)
 {
-    FILE *f = fopen(path, "wb");
+    /* 先尝试 r+b (文件已由预分配创建), 失败则 wb (预分配失败的回退) */
+    FILE *f = fopen(path, "r+b");
+    if (!f) {
+        f = fopen(path, "wb");
+    }
     if (!f) {
         ESP_LOGE(TAG, "muxer: fopen(%s) FAILED errno=%d", path, errno);
         return NULL;
     }
-    /* 512KB FILE 缓冲, 合并小写为大批次, 减少 FAT 操作频率 */
     setvbuf(f, NULL, _IOFBF, 512 * 1024);
-
-    /* 预分配 FAT 簇链: seek 到目标偏移-1, 写 1 字节强制分配所有簇,
-     * 然后 seek 回文件头. 后续写入无需再触发 FAT 表 read→update→write. */
-    if (fseek(f, MUXER_PREALLOC_SIZE - 1, SEEK_SET) == 0) {
-        fwrite("", 1, 1, f);
-        fflush(f);
-        fseek(f, 0, SEEK_SET);
-        ESP_LOGI(TAG, "muxer: fopen(%s) OK, prealloc %dMB",
-                 path, (int)(MUXER_PREALLOC_SIZE / (1024 * 1024)));
-    } else {
-        ESP_LOGW(TAG, "muxer: fopen(%s) OK, prealloc SKIPPED (fseek failed)", path);
-    }
-
     s_muxer_write_end = 0;
+    ESP_LOGI(TAG, "muxer: fopen(%s) OK", path);
     return f;
 }
 
@@ -407,7 +399,6 @@ static int muxer_fwrite(void *writer, void *buffer, int len)
         ESP_LOGE(TAG, "muxer: fwrite(%d) only wrote %d bytes", len, (int)written);
         return -1;
     }
-    /* 跟踪实际数据尾部 (当前 position = 上次写入结束位置) */
     long cur_end = ftell(f);
     if (cur_end > s_muxer_write_end) {
         s_muxer_write_end = cur_end;
@@ -424,10 +415,8 @@ static int muxer_fclose(void *writer)
 {
     FILE *f = (FILE *)writer;
     fflush(f);
-    /* 截断到实际数据大小: 预分配时文件被撑到 16MB, 需裁掉尾部空洞 */
-    if (s_muxer_write_end > 0) {
-        ftruncate(fileno(f), s_muxer_write_end);
-    }
+    /* 始终截断到实际数据大小; 无数据写入时 → 0 字节 (清理空文件) */
+    ftruncate(fileno(f), s_muxer_write_end);
     fsync(fileno(f));
     int ret = fclose(f);
     ESP_LOGI(TAG, "muxer: fclose ret=%d, final_size=%ld", ret, s_muxer_write_end);
@@ -578,6 +567,21 @@ esp_err_t storage_manager_create_video_file(
     strftime(manager->current_video_file.metadata.create_time,
              sizeof(manager->current_video_file.metadata.create_time),
              "%Y-%m-%dT%H:%M:%S", &timeinfo);
+
+    /* 官方预分配: 调用 esp_vfs_fat_create_contiguous_file 通过 FatFs f_expand
+     * 一次性分配连续簇链, 后续写入不再触发 FAT 表 read→update→write */
+    {
+        esp_err_t prealloc_ret = esp_vfs_fat_create_contiguous_file(
+            manager->config.base_path, fullpath,
+            MUXER_PREALLOC_SIZE, true);
+        if (prealloc_ret == ESP_OK) {
+            ESP_LOGI(TAG, "Prealloc %dMB OK: %s",
+                     (int)(MUXER_PREALLOC_SIZE / (1024 * 1024)), fullpath);
+        } else {
+            ESP_LOGW(TAG, "Prealloc failed (err 0x%x), will alloc on-the-fly: %s",
+                     prealloc_ret, fullpath);
+        }
+    }
 
     // 配置 MP4 muxer（同时设置 url_pattern 和 url_pattern_ex，兼容不同库版本）
     s_cur_muxer_mgr = manager;
