@@ -1,0 +1,16 @@
+name: espdl-yolo11-snake
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - ultralytics==8.4.46
+      - esp-ppq==1.2.11
+      - onnx==1.17.0
+      - onnxscript==0.7.0
+      - onnxsim==0.4.36
+      - onnxruntime==1.23.2
+      - opencv-python==4.13.0.92
+      - pillow==12.2.0
+      - pyyaml==6.0.3

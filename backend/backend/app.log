@@ -1,0 +1,55 @@
+2026-04-13 16:52:21,334 - sensors - INFO - 传感器数据处理器初始化完成
+2026-04-13 16:52:21,335 - storage - INFO - 本地存储初始化完成
+2026-04-13 16:52:21,335 - storage - INFO - 数据存储管理器初始化完成（仅本地存储）
+2026-04-13 16:52:21,335 - ai_processing - INFO - 模拟宠物检测器初始化完成
+2026-04-13 16:52:21,335 - ai_processing - INFO - 活动分析器初始化完成
+2026-04-13 16:52:21,335 - ai_processing - INFO - AI处理流水线初始化完成
+2026-04-13 16:52:21,335 - ai_processing - INFO - 模拟宠物检测器初始化完成
+2026-04-13 16:52:21,336 - ai_processing - INFO - 活动分析器初始化完成
+2026-04-13 16:52:21,336 - ai_processing - INFO - AI处理流水线初始化完成
+2026-04-13 16:52:21,336 - sensors - INFO - 传感器数据处理器初始化完成
+2026-04-13 16:52:21,336 - storage - INFO - 本地存储初始化完成
+2026-04-13 16:52:21,336 - storage - INFO - 数据存储管理器初始化完成（仅本地存储）
+2026-04-13 16:52:21,336 - api_routes - INFO - API路由初始化完成
+⚠️ MongoDB连接失败: localhost:27017: [Errno 61] Connection refused (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 5.0s, Topology Description: <TopologyDescription id: 69dcaec0c5fb9bb906670d0c, topology_type: Unknown, servers: [<ServerDescription ('localhost', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('localhost:27017: [Errno 61] Connection refused (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+⚠️ 使用内存模式（仅用于测试）
+==================================================
+🐾 宠语者 - 智能宠物箱后端系统
+版本: 1.0.0
+启动时间: 2026-04-13T16:52:21.348935
+服务地址: http://localhost:5000
+API文档: http://localhost:5000/
+==================================================
+ * Serving Flask app 'app'
+ * Debug mode: on
+2026-04-13 16:52:21,384 - werkzeug - INFO - [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.198.104.129:5001
+2026-04-13 16:52:21,384 - werkzeug - INFO - [33mPress CTRL+C to quit[0m
+2026-04-13 16:52:21,385 - werkzeug - INFO -  * Restarting with stat
+2026-04-13 16:52:26,769 - sensors - INFO - 传感器数据处理器初始化完成
+2026-04-13 16:52:26,769 - storage - INFO - 本地存储初始化完成
+2026-04-13 16:52:26,769 - storage - INFO - 数据存储管理器初始化完成（仅本地存储）
+2026-04-13 16:52:26,769 - ai_processing - INFO - 模拟宠物检测器初始化完成
+2026-04-13 16:52:26,769 - ai_processing - INFO - 活动分析器初始化完成
+2026-04-13 16:52:26,769 - ai_processing - INFO - AI处理流水线初始化完成
+2026-04-13 16:52:26,769 - ai_processing - INFO - 模拟宠物检测器初始化完成
+2026-04-13 16:52:26,769 - ai_processing - INFO - 活动分析器初始化完成
+2026-04-13 16:52:26,769 - ai_processing - INFO - AI处理流水线初始化完成
+2026-04-13 16:52:26,769 - sensors - INFO - 传感器数据处理器初始化完成
+2026-04-13 16:52:26,769 - storage - INFO - 本地存储初始化完成
+2026-04-13 16:52:26,769 - storage - INFO - 数据存储管理器初始化完成（仅本地存储）
+2026-04-13 16:52:26,769 - api_routes - INFO - API路由初始化完成
+2026-04-13 16:52:26,790 - werkzeug - WARNING -  * Debugger is active!
+2026-04-13 16:52:26,800 - werkzeug - INFO -  * Debugger PIN: 525-233-898
+2026-04-13 16:52:26,822 - storage - INFO - 从本地文件加载0条传感器数据
+2026-04-13 16:52:26,823 - werkzeug - INFO - 127.0.0.1 - - [13/Apr/2026 16:52:26] "GET /api/v1/reports/daily?device_id=ESP32-P4-001 HTTP/1.1" 200 -
+2026-04-13 16:52:32,714 - storage - INFO - 视频元数据保存到本地文件: data/videos/video_VID001_20240101_120000.json
+2026-04-13 16:52:32,714 - storage - INFO - 视频元数据保存完成: 本地=data/videos/video_VID001_20240101_120000.json, 数据库=None
+2026-04-13 16:52:32,714 - werkzeug - INFO - 127.0.0.1 - - [13/Apr/2026 16:52:32] "[35m[1mPOST /api/v1/video/metadata HTTP/1.1[0m" 201 -
+/Users/apple/Documents/代码/new_project/backend/app.py:98: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "timestamp": datetime.utcnow().isoformat(),
+2026-04-13 16:52:56,252 - werkzeug - INFO - 127.0.0.1 - - [13/Apr/2026 16:52:56] "GET /health HTTP/1.1" 200 -
+/opt/homebrew/Cellar/python@3.14/3.14.2/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-oexx47gl'}
+  warnings.warn(

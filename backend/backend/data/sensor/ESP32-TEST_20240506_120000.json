@@ -1,0 +1,32 @@
+{
+  "device_id": "ESP32-TEST",
+  "timestamp": "2024-05-06T12:00:00+00:00",
+  "sensors": {
+    "humidity": {
+      "unit": "percent",
+      "value": 60
+    },
+    "temperature": {
+      "unit": "celsius",
+      "value": 25.5
+    }
+  },
+  "data_id": "93336717b43178c6",
+  "_processed": true,
+  "_processing_time": "2026-05-06T13:38:32.642090+00:00",
+  "alerts": [],
+  "summary": {
+    "device_id": "ESP32-TEST",
+    "timestamp": "2024-05-06T12:00:00+00:00",
+    "sensor_count": 2,
+    "has_video": false,
+    "has_status": false,
+    "alerts": [],
+    "humidity_value": 60,
+    "humidity_unit": "percent",
+    "temperature_value": 25.5,
+    "temperature_unit": "celsius"
+  },
+  "_stored_at": "2026-05-06T13:38:32.642187+00:00",
+  "_storage_type": "local_file"
+}

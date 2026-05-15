@@ -1,0 +1,11 @@
+{
+  "video_id": "VID001",
+  "device_id": "ESP32-P4-001",
+  "filename": "test_video.h264",
+  "duration": 30,
+  "resolution": "640x480",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "upload_time": "2026-04-13T08:52:32.714419",
+  "_stored_at": "2026-04-13T08:52:32.714459+00:00",
+  "_storage_type": "video_metadata"
+}

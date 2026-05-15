@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  backend-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/petbox_dev
+      - SECRET_KEY=dev-secret-key-for-development
+    volumes:
+      - .:/app
+      - /app/__pycache__
+      - ./data:/app/data
+    depends_on:
+      - mongo
+    networks:
+      - petbox-dev-network
+    stdin_open: true
+    tty: true
+
+  mongo:
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password
+    volumes:
+      - mongo-dev-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d
+    networks:
+      - petbox-dev-network
+
+volumes:
+  mongo-dev-data:
+
+networks:
+  petbox-dev-network:
+    driver: bridge

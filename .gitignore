@@ -4,7 +4,7 @@ managed_components/
 dependencies.lock
 
 # 本地的配置文件（包含你的电脑路径和私密设置）
-sdkconfig
+
 sdkconfig.old
 
 # 编译器和 IDE 临时文件

@@ -1,0 +1,65 @@
+{
+  "device_id": "ESP32-P4-001",
+  "timestamp": "2024-01-01T12:00:00+00:00",
+  "sensors": {
+    "temperature": {
+      "value": 25.5,
+      "unit": "celsius"
+    },
+    "humidity": {
+      "value": 60,
+      "unit": "percent"
+    },
+    "light": {
+      "value": 800,
+      "unit": "lux"
+    },
+    "motion": {
+      "detected": true,
+      "confidence": 0.85,
+      "location": {
+        "x": 320,
+        "y": 240
+      }
+    }
+  },
+  "data_id": "668c47ce6391a6d2",
+  "status": {
+    "battery": 85,
+    "storage_available": 8192,
+    "wifi_connected": true
+  },
+  "_processed": true,
+  "_processing_time": "2026-04-13T08:49:52.485959+00:00",
+  "alerts": [
+    {
+      "type": "activity_detected",
+      "message": "检测到宠物活动",
+      "severity": "info",
+      "confidence": 0.85
+    }
+  ],
+  "summary": {
+    "device_id": "ESP32-P4-001",
+    "timestamp": "2024-01-01T12:00:00+00:00",
+    "sensor_count": 4,
+    "has_video": false,
+    "has_status": true,
+    "alerts": [
+      {
+        "type": "activity_detected",
+        "message": "检测到宠物活动",
+        "severity": "info",
+        "confidence": 0.85
+      }
+    ],
+    "temperature_value": 25.5,
+    "temperature_unit": "celsius",
+    "humidity_value": 60,
+    "humidity_unit": "percent",
+    "light_value": 800,
+    "light_unit": "lux"
+  },
+  "_stored_at": "2026-04-13T08:49:52.486028+00:00",
+  "_storage_type": "local_file"
+}

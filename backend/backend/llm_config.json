@@ -1,0 +1,200 @@
+{
+  "version": "1.0.0",
+  "description": "宠语者智能宠物箱LLM配置",
+  "models": {
+    "deepseek_reasoner": {
+      "name": "deepseek-reasoner",
+      "provider": "deepseek",
+      "type": "text",
+      "capabilities": ["text_generation", "reasoning", "analysis", "report_generation"],
+      "api_endpoint": "https://api.deepseek.com/v1/chat/completions",
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "api_key_env_var": "DEEPSEEK_API_KEY",
+      "timeout": 30,
+      "max_tokens": 4096,
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0
+    },
+    "qwen_vl_plus": {
+      "name": "qwen-vl-plus",
+      "provider": "qwen",
+      "type": "multimodal",
+      "capabilities": ["image_analysis", "object_detection", "scene_understanding", "video_frame_analysis"],
+      "api_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+      "api_key": "${QWEN_API_KEY}",
+      "api_key_env_var": "QWEN_API_KEY",
+      "timeout": 60,
+      "max_tokens": 2000,
+      "temperature": 0.1,
+      "top_p": 0.8
+    }
+  },
+  "tasks": {
+    "pet_detection": {
+      "name": "宠物检测",
+      "description": "从视频帧中检测宠物类型、位置和活动",
+      "primary_model": "qwen_vl_plus",
+      "fallback_model": "deepseek_reasoner",
+      "input_type": "image",
+      "output_format": {
+        "type": "json",
+        "schema": {
+          "pet_type": "string",
+          "confidence": "float",
+          "bounding_box": {"x": "int", "y": "int", "width": "int", "height": "int"},
+          "activity": "string",
+          "activity_confidence": "float",
+          "timestamp": "string"
+        }
+      },
+      "prompt_templates": {
+        "default": "分析这张宠物箱监控图像，检测宠物类型（猫/狗/兔/鸟/未知），给出置信度，如果检测到宠物，提供边界框坐标（x,y,width,height），并识别宠物当前活动状态（休息/进食/喝水/玩耍/探索/抓挠/发声/未知）",
+        "detailed": "你是一个宠物行为分析专家。请仔细分析这张宠物箱监控图像：\n1. 检测图像中是否有宠物？如果有，是什么类型的宠物？\n2. 给出检测的置信度（0-1）\n3. 如果检测到宠物，提供宠物在图像中的精确边界框坐标（x,y,width,height）\n4. 分析宠物的活动状态：休息、进食、喝水、玩耍、探索、抓挠、发声或其他\n5. 分析宠物的情绪状态（如果可能）\n6. 提供简要的行为分析\n请以JSON格式返回结果。"
+      }
+    },
+    "activity_recognition": {
+      "name": "活动识别",
+      "description": "基于传感器数据和视频检测结果识别宠物活动模式",
+      "primary_model": "deepseek_reasoner",
+      "input_type": "text",
+      "output_format": {
+        "type": "json",
+        "schema": {
+          "activity_type": "string",
+          "confidence": "float",
+          "duration": "float",
+          "description": "string",
+          "energy_level": "string",
+          "health_implications": "array",
+          "recommendations": "array"
+        }
+      },
+      "prompt_templates": {
+        "default": "分析以下宠物传感器数据：{sensor_data_summary}。结合视频检测结果：{video_analysis}。识别宠物的活动模式，提供活动类型、置信度、持续时间估计，并给出健康建议。",
+        "with_history": "分析以下时间段的宠物活动数据：\n时间段：{time_range}\n传感器数据摘要：{sensor_summary}\n视频检测记录：{video_records}\n识别宠物的活动模式、行为趋势和潜在健康问题，提供详细的每日活动分析报告。"
+      }
+    },
+    "daily_report": {
+      "name": "日报生成",
+      "description": "生成宠物每日活动报告和健康建议",
+      "primary_model": "deepseek_reasoner",
+      "input_type": "text",
+      "output_format": {
+        "type": "json",
+        "schema": {
+          "date": "string",
+          "device_id": "string",
+          "summary": {
+            "total_activities": "int",
+            "rest_percentage": "float",
+            "active_percentage": "float",
+            "avg_temperature": "float",
+            "avg_humidity": "float",
+            "activity_trend": "string"
+          },
+          "detailed_analysis": {
+            "morning_activities": "array",
+            "afternoon_activities": "array",
+            "evening_activities": "array",
+            "notable_events": "array"
+          },
+          "health_assessment": {
+            "overall_status": "string",
+            "concerns": "array",
+            "positive_signs": "array"
+          },
+          "recommendations": {
+            "immediate": "array",
+            "long_term": "array"
+          },
+          "fun_facts": "array"
+        }
+      },
+      "prompt_templates": {
+        "default": "作为宠物健康专家，请基于以下数据生成一份宠物日报：\n日期：{date}\n设备：{device_id}\n传感器数据统计：{sensor_stats}\n活动记录：{activity_logs}\n视频分析摘要：{video_summary}\n\n请生成包含以下部分的详细日报：\n1. 活动摘要（总活动次数、休息/活动比例）\n2. 详细时段分析（早/中/晚活动）\n3. 健康评估和关注点\n4. 具体建议（立即执行和长期改进）\n5. 有趣的宠物行为观察\n\n报告需要专业、温暖且对宠物主人有帮助。",
+        "emergency": "紧急情况报告模板：检测到异常模式{anomalies}。请生成紧急报告，重点分析潜在风险、紧急建议和需要立即采取的措施。"
+      }
+    },
+    "alert_analysis": {
+      "name": "告警分析",
+      "description": "分析传感器告警并提供解释建议",
+      "primary_model": "deepseek_reasoner",
+      "input_type": "text",
+      "output_format": {
+        "type": "json",
+        "schema": {
+          "alert_type": "string",
+          "severity": "string",
+          "cause_analysis": "string",
+          "immediate_actions": "array",
+          "preventive_measures": "array",
+          "monitoring_suggestions": "array"
+        }
+      },
+      "prompt_templates": {
+        "temperature_high": "温度告警分析：宠物箱温度{value}°C超过阈值{threshold}°C。分析潜在原因，给出降温建议和宠物健康影响评估。",
+        "temperature_low": "温度过低告警：宠物箱温度{value}°C低于阈值{threshold}°C。分析风险，给出保暖建议。",
+        "humidity_high": "湿度过高告警：湿度{value}%超过阈值{threshold}%。分析对宠物的影响和除湿建议。",
+        "humidity_low": "湿度过低告警：湿度{value}%低于阈值{threshold}%。分析干燥环境对宠物的影响和加湿建议。",
+        "activity_anomaly": "活动异常告警：宠物活动模式异常{description}。分析可能的原因（疾病、压力、环境问题等）。"
+      }
+    }
+  },
+  "prompt_tuning": {
+    "system_prompts": {
+      "deepseek_reasoner": "你是一个专业的宠物行为学家和动物健康专家。你负责分析智能宠物箱的数据，为宠物主人提供专业、准确、温暖的分析和建议。你擅长从传感器数据、视频记录中识别宠物行为模式、健康问题和环境需求。你的回答应该基于科学依据，同时考虑到宠物主人的情感需求。",
+      "qwen_vl_plus": "你是一个专业的计算机视觉系统，专门用于宠物监控和分析。你擅长从宠物箱监控图像中精确检测宠物、识别活动状态、分析行为模式。你的检测需要准确、可靠，为后续的行为分析提供坚实基础。"
+    },
+    "response_format": {
+      "json_structure": "strict",
+      "include_timestamp": true,
+      "include_confidence": true,
+      "language": "zh-CN"
+    }
+  },
+  "api_config": {
+    "retry_policy": {
+      "max_retries": 3,
+      "retry_delay": 1,
+      "backoff_factor": 2,
+      "retry_on_status": [429, 500, 502, 503, 504]
+    },
+    "rate_limiting": {
+      "requests_per_minute": 60,
+      "concurrent_requests": 5
+    },
+    "logging": {
+      "log_requests": true,
+      "log_responses": false,
+      "log_errors": true,
+      "log_level": "INFO"
+    }
+  },
+  "caching": {
+    "enabled": true,
+    "ttl_seconds": 300,
+    "cache_similar_requests": true,
+    "similarity_threshold": 0.9
+  },
+  "fallback_strategy": {
+    "enable_fallback": true,
+    "fallback_order": ["primary_model", "secondary_model", "rule_based"],
+    "rule_based_fallback": {
+      "pet_detection": "mock_detector",
+      "activity_recognition": "rule_based_analyzer",
+      "daily_report": "simple_summary_generator"
+    }
+  },
+  "monitoring": {
+    "enable_metrics": true,
+    "track_latency": true,
+    "track_success_rate": true,
+    "alert_on_failure_rate": 0.2,
+    "performance_thresholds": {
+      "max_latency_seconds": 10,
+      "min_success_rate": 0.95
+    }
+  }
+}

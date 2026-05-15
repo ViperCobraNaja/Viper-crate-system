@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/apple/Documents/代码/ESP32/backend/*.conf)",
+      "Bash(cat /Users/apple/Documents/代码/ESP32/backend/data/sensor/*.json)",
+      "Bash(find *)",
+      "Bash(pdftk \"宠语者——基于边缘感知与大模型日报的智能宠物箱.pdf\" dump_data)"
+    ]
+  }
+}

@@ -38,8 +38,6 @@
 #include "wifi_manager.h"
 #include "app_video.h"
 #include "storage_manager.h"
-#include "esp_imgfx_color_convert.h"
-#include "esp_imgfx_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -50,11 +48,8 @@
 #define ASYNC_WRITE_BUF_COUNT 5
 #define ASYNC_WRITE_BUF_SIZE  (1536 * 1024)  /* 1.5MB 足够最大 IDR 帧 */
 
-/* 颜色转换方案: 1=ESP_IMGFX汇编优化, 0=CPU软件转换 */
-#define USE_ESP_IMGFX 1
-
-/* 调试: 设为 1 用合成彩条替代前10帧NV12数据, 验证编码器输入格式 */
-#define DEBUG_SYNTHETIC_TEST 1
+/* 调试: 设为 1 用合成彩条替代前10帧O_UYY_E_VYY数据, 验证编码器输入格式 */
+#define DEBUG_SYNTHETIC_TEST 0
 
 /* 录像开关: 1=启用SD卡录像, 0=禁用 (运动检测不受影响) */
 #define RECORDING_ENABLED 0
@@ -110,14 +105,15 @@ static video_fmt_t        g_camera_fmt = APP_VIDEO_FMT_RGB565;
 static esp_h264_enc_handle_t           g_h264_enc = NULL;
 static esp_h264_enc_param_hw_handle_t  g_h264_param = NULL;
 static esp_h264_enc_mvm_pkt_t          g_mv_pkt = {0};
-static uint8_t                        *g_enc_nv12_buf = NULL;     /* NV12 编码输入 */
-static size_t                          g_enc_nv12_buf_size = 0;
+static uint8_t                        *g_enc_ouev_buf = NULL;     /* O_UYY_E_VYY 编码输入 */
+static size_t                          g_enc_ouev_buf_size = 0;
 static uint8_t                        *g_enc_out_buf = NULL;      /* H.264 编码输出 */
 static size_t                          g_enc_out_buf_size = 0;
 
 /* PPA 客户端 */
 static ppa_client_handle_t g_ppa_display = NULL;   /* 显示用 (RGB/RGB→RGB) */
 static ppa_client_handle_t g_ppa_encode = NULL;    /* 编码用 (RGB/YUV→YUV) */
+static SemaphoreHandle_t   g_ppa_mutex = NULL;     /* 跨核保护 PPA 硬件 */
 
 /* 缓冲区 */
 static uint8_t  *g_lcd_rgb_buf = NULL;     /* RGB565 LCD 画布 */
@@ -199,25 +195,18 @@ static int g_encode_frame_count = 0;
  *   强信号: mag >= 6    → 用于 trigger/sustain 判决
  *   800x800 噪声 ~1500 块 (mag 2-5), 手 ~200 强块 (mag 6+)
  */
-#define MV_NOISE_THRESHOLD        4    /* mag < 4 丢弃 */
-#define MV_STRONG_THRESHOLD       6    /* mag >= 6 为强运动块 */
-#define MOTION_TRIGGER_STRONG     80   /* 强运动块数 > 80 触发 */
+#define MV_NOISE_THRESHOLD        5    /* mag < 5 丢弃 */
+#define MV_STRONG_THRESHOLD       8    /* mag >= 8 为强运动块 */
+#define MOTION_TRIGGER_STRONG     200  /* 强运动块数 > 200 触发 */
 #define MOTION_TRIGGER_AVG        25
-#define MOTION_TRIGGER_FRAMES      8
-#define MOTION_SUSTAIN_STRONG     40   /* 强运动块数 > 40 续录 */
-#define MOTION_SUSTAIN_MV_COUNT   300
+#define MOTION_TRIGGER_FRAMES      5   /* 连续 5 帧触发 */
+#define MOTION_SUSTAIN_STRONG     100  /* 强运动块数 > 100 续录 */
+#define MOTION_SUSTAIN_MV_COUNT   500
 #define MOTION_SUSTAIN_AVG        15
 #define RECORDING_CHECK_INTERVAL  10000000  /* 10 秒 */
 
 static int     g_motion_trigger_count = 0;
 static int64_t g_last_motion_check_us = 0;
-
-#if USE_ESP_IMGFX
-/* ESP_IMGFX 颜色转换: I420 → NV12 (汇编优化路径, 需要 cached 输入) */
-static esp_imgfx_color_convert_handle_t g_cc_handle = NULL;
-static uint32_t g_cc_enc_w = 0;
-static uint32_t g_cc_enc_h = 0;
-#endif
 
 /* 前向声明 —— 函数定义在文件后面 */
 static esp_err_t ppa_display_process(uint8_t *in_buf, ppa_srm_color_mode_t in_cm,
@@ -227,7 +216,7 @@ static esp_err_t ppa_display_process(uint8_t *in_buf, ppa_srm_color_mode_t in_cm
 static esp_err_t switch_state(sys_state_t new_state);
 static esp_err_t stop_recording(void);
 #if DEBUG_SYNTHETIC_TEST
-static void fill_color_bars_nv12(uint8_t *nv12, uint32_t w, uint32_t h);
+static void fill_color_bars_ouev(uint8_t *ouev, uint32_t w, uint32_t h);
 #endif
 
 static void encode_processor_task(void *arg)
@@ -288,81 +277,16 @@ static void encode_processor_task(void *arg)
         }
         int64_t t_ppa_disp = esp_timer_get_time();
 
-        /* ---- 2. I420 → NV12 (ESP_IMGFX) ---- */
-#if USE_ESP_IMGFX
-        if (job.enc_w != g_cc_enc_w || job.enc_h != g_cc_enc_h) {
-            esp_imgfx_color_convert_cfg_t cc_cfg;
-            esp_imgfx_color_convert_get_cfg(g_cc_handle, &cc_cfg);
-            cc_cfg.in_res.width = job.enc_w;
-            cc_cfg.in_res.height = job.enc_h;
-            esp_imgfx_color_convert_set_cfg(g_cc_handle, &cc_cfg);
-            g_cc_enc_w = job.enc_w;
-            g_cc_enc_h = job.enc_h;
-        }
-        {
-            uint32_t in_size = job.enc_w * job.enc_h * 3 / 2;
-            uint32_t out_size = ALIGN_UP(job.enc_w, 16) * ALIGN_UP(job.enc_h, 16) * 3 / 2;
-            esp_imgfx_data_t in_data = {.data = job.i420_data, .data_len = in_size};
-            esp_imgfx_data_t out_data = {.data = g_enc_nv12_buf, .data_len = out_size};
+        /* ---- 2. 帧池 (O_UYY_E_VYY) 直接喂 H.264, 零拷贝 ---- */
+        /* PPA 输出 = O_UYY_E_VYY = H.264 输入, 无需格式转换也无需 memcpy.
+         * H.264 编码器通过 DMA 读 PSRAM, 绕过 CPU cache, 直接读到 PPA 写入的数据.
+         * ppa_yuv_copy 已完成 M2C, CPU 不在中间修改此 buffer, 无需额外缓存操作. */
+        int64_t t_copy = esp_timer_get_time();
 
-            /* 先 M2C 清掉输出 buffer 旧缓存; IMGFX 内部可能用 DMA 直写 PSRAM,
-             * 若不清则后续 C2M 会把 CPU 脏缓存覆写到 PSRAM 破坏 DMA 结果 */
-            esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
-                            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-
-            esp_imgfx_err_t imgfx_ret = esp_imgfx_color_convert_process(g_cc_handle, &in_data, &out_data);
-            if (imgfx_ret != ESP_IMGFX_ERR_OK) {
-                ESP_LOGW(TAG, "ESP_IMGFX convert failed: %d", imgfx_ret);
-                xQueueSend(g_frame_free_queue, &job.pool_idx, 0);
-                continue;
-            }
-        }
-#else
-        i420_to_nv12(job.i420_data, g_enc_nv12_buf, job.enc_w, job.enc_h);
-#endif
-        int64_t t_i420nv12 = esp_timer_get_time();
-
-        /* CPU 写 NV12 后写回 cache，确保编码器 DMA 可见 */
-        esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
-                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-
-        /* ---- DEBUG: dump 前5帧 NV12 到 SD 卡, 用于 PC 验证数据正确性 ---- */
-        {
-            static int dump_count = 0;
-            if (dump_count < 5 && g_storage) {
-                char path[64];
-                snprintf(path, sizeof(path), "/sdcard/dump_%d.nv12", dump_count);
-                FILE *f = fopen(path, "wb");
-                if (f) {
-                    size_t written = fwrite(g_enc_nv12_buf, 1, g_enc_nv12_buf_size, f);
-                    fclose(f);
-                    ESP_LOGI(TAG, "DUMP %s: %u/%u bytes", path, (unsigned)written, (unsigned)g_enc_nv12_buf_size);
-                }
-                dump_count++;
-            }
-        }
-
-        /* ---- DEBUG: 前10帧用合成彩条替代真实NV12数据 ---- */
-#if DEBUG_SYNTHETIC_TEST
-        {
-            static int synth_count = 0;
-            if (synth_count < 10) {
-                fill_color_bars_nv12(g_enc_nv12_buf, job.enc_w, job.enc_h);
-                /* 合成数据是 CPU 写入的, 必须 C2M 刷到 PSRAM 才能被编码器 DMA 读到 */
-                esp_cache_msync(g_enc_nv12_buf, g_enc_nv12_buf_size,
-                                ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-                if (synth_count == 0) {
-                    ESP_LOGI(TAG, "SYNTH: color bars injected (800x800 NV12)");
-                }
-                synth_count++;
-            }
-        }
-#endif
-
-        /* ---- 3. H.264 硬件编码 ---- */
+        /* ---- 3. H.264 硬件编码 (零拷贝: 直接从帧池 DMA 读取) ---- */
         esp_h264_enc_in_frame_t in_frame = {
-            .raw_data.buffer = g_enc_nv12_buf,
-            .raw_data.len    = g_enc_nv12_buf_size,
+            .raw_data.buffer = job.i420_data,
+            .raw_data.len    = job.enc_w * job.enc_h * 3 / 2,
             .pts             = job.timestamp,
         };
         esp_h264_enc_out_frame_t out_frame = {
@@ -467,11 +391,11 @@ static void encode_processor_task(void *arg)
         static int perf_counter = 0;
         if (++perf_counter % 30 == 0) {
             int64_t total = t_sd - t_proc_start;
-            ESP_LOGI(TAG, "⏱ perf: total=%lldms | ppa_disp=%lld i420=%lld h264=%lld mv_proc=%lld sd_queue=%lld",
+            ESP_LOGI(TAG, "⏱ perf: total=%lldms | ppa_disp=%lld copy=%lld h264=%lld mv_proc=%lld sd_queue=%lld",
                      total / 1000,
                      (t_ppa_disp - t_proc_start) / 1000,
-                     (t_i420nv12 - t_ppa_disp) / 1000,
-                     (t_h264 - t_i420nv12) / 1000,
+                     (t_copy - t_ppa_disp) / 1000,
+                     (t_h264 - t_copy) / 1000,
                      (t_mv_proc - t_h264) / 1000,
                      (t_sd - t_mv_proc) / 1000);
         }
@@ -486,73 +410,38 @@ static int64_t g_fps_last_time = 0;
 static int     g_fps_frame_count = 0;
 static int     g_fps_display_count = 0;
 static int     g_display_skip_count = 0;   /* 选择性显示计数器 */
-#define DISPLAY_EVERY_N  3  /* 每N帧显示1次 */
+#define DISPLAY_EVERY_N  1  /* 每N帧显示1次 */
 
 #if DEBUG_SYNTHETIC_TEST
-/* 生成标准彩条 NV12 测试帧 (O_UYY_E_VYY):
+/* 生成 O_UYY_E_VYY 格式合成彩条测试帧:
  *   竖条: 白→黄→青→绿→红 (各 160px @800w)
- *   Y/U/V 值按 BT.601 全范围计算 */
-static void fill_color_bars_nv12(uint8_t *nv12, uint32_t w, uint32_t h)
+ *   Y/U/V 值按 BT.601 全范围计算
+ *   布局参照 esp_h264 官方测试代码 h264_io.c:read_enc_cb_420() */
+static void fill_color_bars_ouev(uint8_t *ouev, uint32_t w, uint32_t h)
 {
     static const uint8_t bar_y[5] = {255, 226, 179, 150,  76};
     static const uint8_t bar_u[5] = {128,   0, 171,  43,  85};
     static const uint8_t bar_v[5] = {128, 149,   0,  21, 255};
     uint32_t bar_w = w / 5;
-    uint32_t y_size = w * h;
 
-    /* Y 平面: 每行竖条填充 */
-    for (uint32_t row = 0; row < h; row++) {
-        for (uint32_t col = 0; col < w; col++) {
+    for (uint32_t row = 0; row < h; row += 2) {
+        uint8_t *p_u_row = ouev + row * (w * 3 / 2);       /* 偶数行: UYY */
+        uint8_t *p_v_row = ouev + (row + 1) * (w * 3 / 2);  /* 奇数行: VYY */
+
+        for (uint32_t col = 0; col < w; col += 2) {
             int bar = col / bar_w;
             if (bar > 4) bar = 4;
-            nv12[row * w + col] = bar_y[bar];
+
+            /* 偶数行: U + Y_left + Y_right */
+            *p_u_row++ = bar_u[bar];
+            *p_u_row++ = bar_y[bar];
+            *p_u_row++ = bar_y[bar];
+
+            /* 奇数行: V + Y_left + Y_right */
+            *p_v_row++ = bar_v[bar];
+            *p_v_row++ = bar_y[bar];
+            *p_v_row++ = bar_y[bar];
         }
-    }
-
-    /* UV 平面: NV12 交织 UV (2x2 子采样) */
-    uint8_t *uv = nv12 + y_size;
-    for (uint32_t row = 0; row < h / 2; row++) {
-        for (uint32_t col = 0; col < w / 2; col++) {
-            int bar = (col * 2) / bar_w;
-            if (bar > 4) bar = 4;
-            uv[(row * (w / 2) + col) * 2]     = bar_u[bar];
-            uv[(row * (w / 2) + col) * 2 + 1] = bar_v[bar];
-        }
-    }
-}
-#endif
-
-/* ========================================================================== */
-/* 色彩格式转换: I420 → NV12 (O_UYY_E_VYY) — CPU 软件版本                      */
-/* ========================================================================== */
-
-#if !USE_ESP_IMGFX
-static void i420_to_nv12(const uint8_t *i420, uint8_t *nv12,
-                         uint32_t width, uint32_t height)
-{
-    uint32_t y_size  = width * height;
-    uint32_t uv_size = y_size / 4;
-
-    memcpy(nv12, i420, y_size);
-
-    const uint8_t *u_plane = i420 + y_size;
-    const uint8_t *v_plane = i420 + y_size + uv_size;
-    uint8_t *uv_dst = nv12 + y_size;
-
-    /* 以32字节块读写，利用PSRAM突发带宽 */
-    uint32_t block_count = uv_size / 32;
-    uint32_t rem = uv_size % 32;
-
-    for (uint32_t i = 0; i < block_count; i++) {
-        uint32_t off = i * 32;
-        for (int j = 0; j < 32; j++) {
-            uv_dst[(off + j) * 2]     = u_plane[off + j];
-            uv_dst[(off + j) * 2 + 1] = v_plane[off + j];
-        }
-    }
-    for (uint32_t i = block_count * 32; i < uv_size; i++) {
-        uv_dst[i * 2]     = u_plane[i];
-        uv_dst[i * 2 + 1] = v_plane[i];
     }
 }
 #endif
@@ -614,7 +503,10 @@ static esp_err_t ppa_display_process(
         .byte_swap         = 0,
         .mode              = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_scale_rotate_mirror(g_ppa_display, &cfg);
+    xSemaphoreTake(g_ppa_mutex, portMAX_DELAY);
+    esp_err_t ret = ppa_do_scale_rotate_mirror(g_ppa_display, &cfg);
+    xSemaphoreGive(g_ppa_mutex);
+    return ret;
 }
 
 /**
@@ -648,7 +540,9 @@ static esp_err_t ppa_encode_scale(
         .byte_swap         = 0,
         .mode              = PPA_TRANS_MODE_BLOCKING,
     };
+    xSemaphoreTake(g_ppa_mutex, portMAX_DELAY);
     esp_err_t ret = ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+    xSemaphoreGive(g_ppa_mutex);
     if (ret == ESP_OK) {
         esp_cache_msync(yuv_out, out_buf_size,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
@@ -688,7 +582,9 @@ static esp_err_t ppa_yuv_copy(uint8_t *in_buf, uint32_t w, uint32_t h,
         .byte_swap         = 0,
         .mode              = PPA_TRANS_MODE_BLOCKING,
     };
+    xSemaphoreTake(g_ppa_mutex, portMAX_DELAY);
     esp_err_t ret = ppa_do_scale_rotate_mirror(g_ppa_encode, &cfg);
+    xSemaphoreGive(g_ppa_mutex);
     if (ret == ESP_OK) {
         /* PPA DMA 写入后需使 CPU cache 无效，确保 CPU 读取到最新数据 */
         esp_cache_msync(yuv_out, out_buf_size,
@@ -735,7 +631,7 @@ static esp_err_t init_h264_encoder(const esp_h264_enc_cfg_hw_t *cfg)
     uint16_t mb_h = (cfg->res.height + 15) >> 4;
     g_mv_pkt.len = mb_w * mb_h * sizeof(esp_h264_enc_mv_data_t);
     g_mv_pkt.data = esp_h264_aligned_calloc(16, 1, g_mv_pkt.len,
-                                             &g_mv_pkt.len, ESP_H264_MEM_SPIRAM);
+                                             &g_mv_pkt.len, ESP_H264_MEM_INTERNAL);
     if (!g_mv_pkt.data) {
         ESP_LOGE(TAG, "Failed to allocate MV buffer");
         esp_h264_enc_del(g_h264_enc);
@@ -743,13 +639,13 @@ static esp_err_t init_h264_encoder(const esp_h264_enc_cfg_hw_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    g_enc_nv12_buf_size = ALIGN_UP(cfg->res.width, 16) *
+    g_enc_ouev_buf_size = ALIGN_UP(cfg->res.width, 16) *
                           ALIGN_UP(cfg->res.height, 16) * 3 / 2;
-    g_enc_nv12_buf = heap_caps_aligned_alloc(g_cache_line_size,
-                                              g_enc_nv12_buf_size,
+    g_enc_ouev_buf = heap_caps_aligned_alloc(g_cache_line_size,
+                                              g_enc_ouev_buf_size,
                                               MALLOC_CAP_SPIRAM);
-    if (!g_enc_nv12_buf) {
-        ESP_LOGE(TAG, "Failed to allocate NV12 encode buffer");
+    if (!g_enc_ouev_buf) {
+        ESP_LOGE(TAG, "Failed to allocate O_UYY_E_VYY encode buffer");
         esp_h264_free(g_mv_pkt.data);
         g_mv_pkt.data = NULL;
         esp_h264_enc_del(g_h264_enc);
@@ -757,14 +653,14 @@ static esp_err_t init_h264_encoder(const esp_h264_enc_cfg_hw_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    g_enc_out_buf_size = g_enc_nv12_buf_size;
+    g_enc_out_buf_size = g_enc_ouev_buf_size;
     g_enc_out_buf = heap_caps_aligned_alloc(g_cache_line_size,
                                              g_enc_out_buf_size,
                                              MALLOC_CAP_SPIRAM);
     if (!g_enc_out_buf) {
         ESP_LOGE(TAG, "Failed to allocate encode output buffer");
-        heap_caps_free(g_enc_nv12_buf);
-        g_enc_nv12_buf = NULL;
+        heap_caps_free(g_enc_ouev_buf);
+        g_enc_ouev_buf = NULL;
         esp_h264_free(g_mv_pkt.data);
         g_mv_pkt.data = NULL;
         esp_h264_enc_del(g_h264_enc);
@@ -777,8 +673,8 @@ static esp_err_t init_h264_encoder(const esp_h264_enc_cfg_hw_t *cfg)
         ESP_LOGE(TAG, "esp_h264_enc_open failed: %d", ret);
         heap_caps_free(g_enc_out_buf);
         g_enc_out_buf = NULL;
-        heap_caps_free(g_enc_nv12_buf);
-        g_enc_nv12_buf = NULL;
+        heap_caps_free(g_enc_ouev_buf);
+        g_enc_ouev_buf = NULL;
         esp_h264_free(g_mv_pkt.data);
         g_mv_pkt.data = NULL;
         esp_h264_enc_del(g_h264_enc);
@@ -803,10 +699,10 @@ static void deinit_h264_encoder(void)
         esp_h264_free(g_mv_pkt.data);
         g_mv_pkt.data = NULL;
     }
-    if (g_enc_nv12_buf) {
-        heap_caps_free(g_enc_nv12_buf);
-        g_enc_nv12_buf = NULL;
-        g_enc_nv12_buf_size = 0;
+    if (g_enc_ouev_buf) {
+        heap_caps_free(g_enc_ouev_buf);
+        g_enc_ouev_buf = NULL;
+        g_enc_ouev_buf_size = 0;
     }
     if (g_enc_out_buf) {
         heap_caps_free(g_enc_out_buf);
@@ -981,6 +877,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to init PPA");
         return;
     }
+    g_ppa_mutex = xSemaphoreCreateMutex();
 
     /* ---- 分配缓冲区 ---- */
     size_t lcd_buf_size = ALIGN_UP(BSP_LCD_H_RES * BSP_LCD_V_RES * 2,
@@ -1028,26 +925,6 @@ void app_main(void)
     }
     g_state = SYS_STATE_MONITOR;
 
-#if USE_ESP_IMGFX
-    /* ---- ESP_IMGFX 颜色转换引擎 (I420→NV12, 汇编优化) ---- */
-    {
-        esp_imgfx_color_convert_cfg_t cc_cfg = {
-            .in_res = {.width = CAM_WIDTH, .height = CAM_HEIGHT},
-            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_I420,
-            .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_O_UYY_E_VYY,
-            .color_space_std = ESP_IMGFX_COLOR_SPACE_STD_BT709,
-        };
-        esp_imgfx_err_t imgfx_ret = esp_imgfx_color_convert_open(&cc_cfg, &g_cc_handle);
-        if (imgfx_ret != ESP_IMGFX_ERR_OK) {
-            ESP_LOGE(TAG, "ESP_IMGFX open failed: %d", imgfx_ret);
-            return;
-        }
-        g_cc_enc_w = CAM_WIDTH;
-        g_cc_enc_h = CAM_HEIGHT;
-        ESP_LOGI(TAG, "ESP_IMGFX I420→NV12 ready (%dx%d, BT709)", CAM_WIDTH, CAM_HEIGHT);
-    }
-#endif
-
     /* ---- SD 卡存储管理器 ---- */
     storage_manager_config_t storage_cfg = {
         .base_path       = "/sdcard",
@@ -1090,10 +967,10 @@ void app_main(void)
     }
 #endif
 
-    /* ---- 编码处理 task (从帧队列取帧: IMGFX + H264 + MV + 状态机) ---- */
+    /* ---- 编码处理 task (从帧队列取帧: memcpy + H264 + MV + 状态机) ---- */
     xTaskCreatePinnedToCore(encode_processor_task, "encode_proc",
-                            8192, NULL, 5, &g_encode_task, 0);
-    ESP_LOGI(TAG, "Encode processor task started on core 0");
+                            8192, NULL, 5, &g_encode_task, 1);
+    ESP_LOGI(TAG, "Encode processor task started on core 1");
 
     /* ---- WiFi 配网启动 (非阻塞, SoftAP + HTTP server) ---- */
     wifi_manager_init();
@@ -1160,9 +1037,6 @@ void app_main(void)
     /* 清理 */
     stop_recording();
     app_video_close(fd);
-#if USE_ESP_IMGFX
-    if (g_cc_handle) esp_imgfx_color_convert_close(g_cc_handle);
-#endif
     deinit_h264_encoder();
     if (g_storage) storage_manager_deinit(g_storage);
 }

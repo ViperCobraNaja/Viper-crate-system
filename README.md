@@ -24,14 +24,14 @@
 camera_frame_cb()              输入帧回调 (core 1)
   │
   ├── PPA DMA copy             uncached → cached PSRAM (~10ms)
+  │     │                      输出格式 = O_UYY_E_VYY (TRM 行交织 YUV420)
+  │     ▼
+  │   frame pool (PSRAM)       5×960KB 缓冲环
   │     │
   │     ▼
-  │   frame pool (PSRAM)       4×960KB 缓冲环
+  │   encode_processor_task    编码处理 (core 1, prio 5)
   │     │
-  │     ▼
-  │   encode_processor_task    编码处理 (core 0, prio 5)
-  │     │
-  │     ├── I420 → NV12         ESP_IMGFX 汇编优化 (~20ms)
+  │     ├── memcpy              帧池 → 编码 buffer (~1ms)
   │     ├── H.264 编码          esp_h264_enc_single_hw (~28ms)
   │     ├── MV 运动检测          两级分类 (strong_mv)
   │     └── SD 入队             异步写入队列
@@ -40,7 +40,7 @@ camera_frame_cb()              输入帧回调 (core 1)
   │         async_sd_writer_task  SD 写入 (core 1, prio 2)
   │           └── esp_muxer → MP4 封装 → FatFS → SDMMC
   │
-  └── PPA display scale         YUV420→RGB565 1024×600 (每3帧, ~59ms)
+  └── PPA display scale         YUV420→RGB565 1024×600 (每1帧, ~59ms)
         │
         ▼
       LVGL canvas → MIPI DSI LCD
@@ -54,14 +54,15 @@ camera_frame_cb()              输入帧回调 (core 1)
 | `components/storage_manager/` | SD 卡管理、文件预分配、MP4 封装 |
 | `components/app_video/` | V4L2 摄像头抽象层 |
 | `components/esp_muxer/` | MP4 多路复用器 |
-| `components/esp_image_effects/` | ESP_IMGFX 硬件辅助颜色转换 |
 | `components/gmf_video/` | 官方 ESP-GMF-Video v0.8.3（分析用，未启用） |
 | `components/cloud_interface/` | 云端接口（预留） |
 | `components/motion_detector/` | 运动检测器（预留） |
 
+> **关键发现 (2026-05)**: PPA 输出的 YUV420 格式按 TRM 定义为行交织 UYY/VYY，即 O_UYY_E_VYY 格式，与 H.264 硬件编码器输入格式一致。PPA 输出可直接喂给 H.264，无需中间格式转换（省掉 ESP_IMGFX ~20ms）。此前颜色异常（绿色画面）根因为 PPA 输出被误当作标准 I420 喂给 IMGFX 做二次转换。
+
 ## 当前功能
 
-- [x] **实时预览**: 摄像头 YUV420 @800×800，PPA 缩放至 1024×600 LCD，每 3 帧显示一次节省 PPA 带宽
+- [x] **实时预览**: 摄像头 YUV420 @800×800，PPA 缩放至 1024×600 LCD，每 1 帧显示一次
 - [x] **运动检测**: 基于 H.264 MV 的两级分类算法 —— `mag<4` 丢弃噪声，`mag≥6` 统计强运动块，连续 8 帧触发录像
 - [x] **H.264 录像**: 硬件编码器 800×800，2Mbps，GOP=15，封装为 MP4 存储至 SD 卡
 - [x] **异步 SD 写入**: 5×1.5MB PSRAM 缓冲队列，解耦编码 pipeline 与 SD 卡写入延迟
@@ -72,14 +73,14 @@ camera_frame_cb()              输入帧回调 (core 1)
 
 | 操作 | 耗时 | 说明 |
 |------|------|------|
-| PPA DMA copy (uncached→cached) | ~10ms | 硬件 DMA 替代 CPU uncached memcpy (原 84ms) |
-| I420→NV12 (ESP_IMGFX) | ~20ms | 汇编优化，含缓存同步 |
+| PPA DMA copy (uncached→cached) | ~10ms | 硬件 DMA 替代 CPU uncached memcpy (原 84ms)，输出 O_UYY_E_VYY |
+| memcpy (帧池→编码 buffer) | ~1ms | 无需格式转换 (PPA 输出 = H.264 输入) |
 | H.264 编码 (800×800) | ~28ms | 硬件编码器 |
 | PPA 显示缩放 (YUV→RGB565) | ~59ms | 每 3 帧一次，阻塞模式 |
 | SD 写入 (P帧) | 1~5ms | 预分配后极快 |
 | SD 写入 (I帧) | ~70ms | 数据量大 |
 
-**预期帧率**: 无显示帧 ~17fps，含显示帧 ~8.5fps，平均 ~12fps（按 1/3 显示比例）。
+**预期帧率**: ~12fps（每帧都显示，PPA 阻塞模式约 59ms/帧）。
 
 ## 遇到的问题
 
@@ -140,7 +141,7 @@ FAT32 每次分配新簇需读 FAT 表→修改→写回，零碎写入放大 I/
 SRAM (内部, 512KB)              PSRAM (外部, 16MB)
 ├── 栈 (task + ISR)             ├── 帧缓冲池 4×960KB
 ├── FreeRTOS 内核               ├── LCD 画布 1.2MB
-├── 驱动 / 中断 / DMA 描述符     ├── NV12 编码缓冲 960KB
+├── 驱动 / 中断 / DMA 描述符     ├── O_UYY_E_VYY 编码缓冲 960KB
 ├── 日志缓冲区                   ├── H.264 输出缓冲 512KB
 ├── FatFS 工作缓冲               ├── 异步 SD 写入池 5×1.5MB
 └── 其他小对象                   ├── ESP_IMGFX 工作缓冲
@@ -153,7 +154,7 @@ SRAM (内部, 512KB)              PSRAM (外部, 16MB)
 
 | 任务 | Core | 优先级 | 栈 | 职责 |
 |------|------|--------|-----|------|
-| `encode_proc` | 0 | 5 | 8KB | IMGFX + H.264 + MV + 状态机 |
+| `encode_proc` | 1 | 5 | 8KB | IMGFX + H.264 + MV + 状态机 |
 | `sd_writer` | 1 | 2 | 4KB | 从 ready 队列取数据写 SD |
 | `app_video` (系统) | — | 默认 | — | 摄像头驱动，帧回调 |
 | LVGL tick | — | 默认 | — | UI 刷新，每 10ms |
@@ -194,20 +195,22 @@ CONFIG_FATFS_ALLOC_PREFER_EXTRAM=n   # FatFS 内部缓冲放 SRAM(更快)
 
 ### 合成彩条测试
 
-`DEBUG_SYNTHETIC_TEST=1` 时前 10 帧用已知彩色竖条（白→黄→青→绿→红）替代摄像头数据，验证 H.264 编码器 NV12 输入格式。录像中颜色分明则格式正确，颜色错乱则 U/V 顺序反了。
+`DEBUG_SYNTHETIC_TEST=1` 时前 10 帧用已知彩色竖条（白→黄→青→绿→红）替代摄像头数据，验证 H.264 编码器 O_UYY_E_VYY 输入格式。录像中颜色分明则格式正确，颜色错乱则 U/V 顺序反了。
 
-### NV12 裸数据 Dump
+### O_UYY_E_VYY 裸数据 Dump
 
-前 5 帧编码前 NV12 数据写入 `/sdcard/dump_0.nv12` ~ `dump_4.nv12`，PC 端验证：
+前 5 帧 PPA 输出 (`/sdcard/dump_0.ppa` ~ `dump_4.ppa`) 和 camera_cb 输出 (`/sdcard/dump_cb_0.ppa` ~ `dump_cb_4.ppa`)。该格式即 H.264 硬件编码器所需的 O_UYY_E_VYY（UYY/VYY 行交织），可用 `tools/ouev_to_i420.py` 转换为 I420 或 PNG 查看。
+
+播放命令:
 ```bash
-ffplay -f rawvideo -pixel_format nv12 -video_size 800x800 dump_0.nv12
+python ouev_to_i420.py dump_0.ppa --png dump_0.png
 ```
 
 ### 性能日志
 
 每 30 帧输出逐操作耗时拆解：
 ```
-⏱ perf: total=62ms | ppa_disp=0 i420=19 h264=28 mv_proc=0 sd_queue=1
+⏱ perf: total=62ms | ppa_disp=0 copy=1 h264=28 mv_proc=0 sd_queue=1
 ```
 精确定位每一步的瓶颈变化。
 
@@ -215,7 +218,7 @@ ffplay -f rawvideo -pixel_format nv12 -video_size 800x800 dump_0.nv12
 
 ### 第一阶段: 稳定性 (进行中)
 
-- [ ] NV12 合成彩条测试确认数据格式
+- [ ] O_UYY_E_VYY 合成彩条测试确认数据格式
 - [ ] 两级 MV 分类实测调参（闭盖/手运动场景）
 - [ ] 视频画面异常根因确认与修复
 - [ ] 0KB 文件根除
