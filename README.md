@@ -2,13 +2,14 @@
 
 基于 ESP32-P4 的智能宠物箱监控系统。利用硬件 H.264 编码器的运动矢量（MV）实现零额外开销的运动感知，自动触发录像并存储至 SD 卡，通过 LVGL + MIPI DSI LCD 实时预览。
 
-> **当前状态**: 核心功能已打通，运动检测与视频录制在调试优化中。视频录制暂时搁置，优先解决数据正确性与检测准确性问题。
+> **当前状态**: AI 蛇检测三态状态机已上线（MONITOR→AI_VERIFY→RECORDING），活动追踪 JSON 日志写入 SD 卡，YOLO11n 模型骨架就绪待接入 ESP-DL。视频录制暂时搁置。
 
 ## 硬件
 
 | 模块 | 型号 | 接口 |
 |------|------|------|
-| 主控 | ESP32-P4 (PSRAM 16MB) | — |
+| 主控 | ESP32-P4 (PSRAM 32MB) | — |
+| WiFi | ESP32-C6 (SDIO 从芯片) | SDIO 4-bit 40MHz |
 | 摄像头 | OV5647 | MIPI CSI 2-lane, RAW8→ISP→YUV420 800×800 |
 | 显示屏 | EK79007 | MIPI DSI 1024×600, LVGL + PPA 缩放 |
 | 触摸 | GT911 | I2C |
@@ -31,43 +32,71 @@ camera_frame_cb()              输入帧回调 (core 1)
   │     ▼
   │   encode_processor_task    编码处理 (core 1, prio 5)
   │     │
-  │     ├── memcpy              帧池 → 编码 buffer (~1ms)
-  │     ├── H.264 编码          esp_h264_enc_single_hw (~28ms)
+  │     ├── PPA display scale   YUV→RGB565 1024×600 (~59ms)
+  │     ├── H.264 编码          esp_h264_enc_single_hw (~15ms)
   │     ├── MV 运动检测          两级分类 (strong_mv)
-  │     └── SD 入队             异步写入队列
+  │     ├── [新] 三态状态机       MONITOR → AI_VERIFY → RECORDING
+  │     │     ├── MONITOR       MV 触发阈值检测
+  │     │     ├── AI_VERIFY     snake_detect 每帧推理确认
+  │     │     └── RECORDING     双重检测(5s) + 位置追踪(1s)
+  │     └── SD 入队             异步写入队列 (暂未开录像)
   │           │
   │           ▼
   │         async_sd_writer_task  SD 写入 (core 1, prio 2)
-  │           └── esp_muxer → MP4 封装 → FatFS → SDMMC
   │
-  └── PPA display scale         YUV420→RGB565 1024×600 (每1帧, ~59ms)
+  └── snake_detect              AI 蛇检测 (PPA 800→320 RGB, 骨架)
         │
         ▼
-      LVGL canvas → MIPI DSI LCD
+      activity_tracker           活动追踪 (JSONL 写入 SD)
+```
+
+### 状态机
+
+```
+MONITOR ──MV trigger(strong>200 x5)──▶ AI_VERIFY
+                                           │
+                                 AI confirm(连续2帧置信度>0.5)
+                                           │
+                                           ▼
+                                       RECORDING
+                                    (不录像, 只追踪)
+                                           │
+                               ┌───────────┴───────────┐
+                         每 5s 双重检测          每 1s 记录位置
+                         (MV + AI)              (activity_tracker)
+                               │
+                         两路都失败 10s → MONITOR
 ```
 
 ### 核心组件
 
 | 组件 | 功能 |
 |------|------|
-| `main/main.c` | 主程序：状态机、编码 pipeline、MV 运动检测、帧率统计 |
+| `main/main.c` | 主程序：三态状态机、编码 pipeline、MV 运动检测、双重检测、帧率统计 |
+| `components/snake_detect/` | [新] AI 蛇检测 — PPA 800→320 RGB 缩放 + YOLO11n 接口骨架 |
+| `components/activity_tracker/` | [新] 活动追踪 — 事件/位置记录、JSONL 日志写入 SD 卡 |
 | `components/storage_manager/` | SD 卡管理、文件预分配、MP4 封装 |
 | `components/app_video/` | V4L2 摄像头抽象层 |
 | `components/esp_muxer/` | MP4 多路复用器 |
-| `components/gmf_video/` | 官方 ESP-GMF-Video v0.8.3（分析用，未启用） |
+| `components/wifi_manager/` | WiFi 配网（SoftAP + HTTP）+ NTP 时间同步 |
 | `components/cloud_interface/` | 云端接口（预留） |
 | `components/motion_detector/` | 运动检测器（预留） |
+| `components/gmf_video/` | 官方 ESP-GMF-Video v0.8.3（分析用，未启用） |
 
 > **关键发现 (2026-05)**: PPA 输出的 YUV420 格式按 TRM 定义为行交织 UYY/VYY，即 O_UYY_E_VYY 格式，与 H.264 硬件编码器输入格式一致。PPA 输出可直接喂给 H.264，无需中间格式转换（省掉 ESP_IMGFX ~20ms）。此前颜色异常（绿色画面）根因为 PPA 输出被误当作标准 I420 喂给 IMGFX 做二次转换。
 
 ## 当前功能
 
 - [x] **实时预览**: 摄像头 YUV420 @800×800，PPA 缩放至 1024×600 LCD，每 1 帧显示一次
-- [x] **运动检测**: 基于 H.264 MV 的两级分类算法 —— `mag<4` 丢弃噪声，`mag≥6` 统计强运动块，连续 8 帧触发录像
-- [x] **H.264 录像**: 硬件编码器 800×800，2Mbps，GOP=15，封装为 MP4 存储至 SD 卡
-- [x] **异步 SD 写入**: 5×1.5MB PSRAM 缓冲队列，解耦编码 pipeline 与 SD 卡写入延迟
-- [x] **文件预分配**: 录像文件启动时通过 `esp_vfs_fat_create_contiguous_file` 预分配 64MB 连续簇
-- [x] **帧率统计**: 每 30 帧输出逐操作耗时拆解（ppa_disp / i420 / h264 / mv_proc / sd_queue）
+- [x] **三态状态机**: MONITOR (MV 监控) → AI_VERIFY (AI 确认, 每帧推理) → RECORDING (双重检测 + 位置追踪)
+- [x] **AI 蛇检测**: snake_detect 组件骨架 — PPA 800→320 RGB 缩放就绪，模拟推理返回 (ESP-DL 真实推理延后)
+- [x] **运动检测**: 基于 H.264 MV 的两级分类 —— `mag<5` 丢弃，`mag≥8` 为强运动块
+- [x] **双重检测**: RECORDING 态每 5 秒 MV + AI 联合判定，两路都失败 10 秒后停止
+- [x] **活动追踪**: 事件开始/结束时间、每秒蛇头位置采样、JSONL 日志写入 SD 卡 (`/sdcard/logs/activity_YYYYMMDD.jsonl`)
+- [x] **NTP 时间同步**: WiFi 连接后自动同步 (ntp.aliyun.com)，所有时间戳用 Unix time
+- [x] **H.264 编码**: 硬件编码器 800×800 (仅用于 MV 检测, 暂不录像)
+- [x] **异步 SD 写入**: 5×1.5MB PSRAM 缓冲队列 (暂未开录像)
+- [x] **帧率统计**: 每 30 帧输出逐操作耗时拆解
 
 ## 性能数据
 
@@ -133,18 +162,31 @@ FAT32 每次分配新簇需读 FAT 表→修改→写回，零碎写入放大 I/
 
 **修复**: `fclose` 前始终 `ftruncate(fileno(f), actual_size)`，无数据时截断至 0。
 
+### 7. activity_event_t BSS 溢出 → SDIO 内存池初始化失败
+
+`activity_event_t` 内嵌 `position_samples[3600]` + `zone_track[3600]` = ~43KB 静态 BSS，挤占内部 DRAM (~500KB) 导致 ESP-Hosted SDIO mempool 初始化失败 (`sdio_mempool_create: no mem`)。
+
+**修复**: `g_current_event` 从静态变量改为 PSRAM 堆分配指针 (`heap_caps_calloc`)，~43KB 从 .bss 迁移到外部 PSRAM。
+
+### 8. RECORDING→MONITOR 编码器重建失败
+
+返回 MONITOR 时调用 `switch_state()` 触发编码器 deinit/reinit，但 RECORDING 一直用的 monitor 配置（未切换），重建时内存不足 (`No memory for reference frame`)。
+
+**修复**: RECORDING→MONITOR 直接改 `g_state`，不重建编码器（同配置无需重建）。
+
 ## FreeRTOS 内存与任务优化
 
 ### 内存布局策略
 
 ```
-SRAM (内部, 512KB)              PSRAM (外部, 16MB)
-├── 栈 (task + ISR)             ├── 帧缓冲池 4×960KB
+SRAM (内部, 512KB)              PSRAM (外部, 32MB)
+├── 栈 (task + ISR)             ├── 帧缓冲池 5×960KB
 ├── FreeRTOS 内核               ├── LCD 画布 1.2MB
 ├── 驱动 / 中断 / DMA 描述符     ├── O_UYY_E_VYY 编码缓冲 960KB
 ├── 日志缓冲区                   ├── H.264 输出缓冲 512KB
 ├── FatFS 工作缓冲               ├── 异步 SD 写入池 5×1.5MB
-└── 其他小对象                   ├── ESP_IMGFX 工作缓冲
+├── SDIO mempool                ├── AI RGB 缓冲 320×320×2
+└── 其他小对象                   ├── activity_event 43KB (PSRAM heap)
                                 └── FatFS 文件缓存 512KB
 ```
 
@@ -154,8 +196,8 @@ SRAM (内部, 512KB)              PSRAM (外部, 16MB)
 
 | 任务 | Core | 优先级 | 栈 | 职责 |
 |------|------|--------|-----|------|
-| `encode_proc` | 1 | 5 | 8KB | IMGFX + H.264 + MV + 状态机 |
-| `sd_writer` | 1 | 2 | 4KB | 从 ready 队列取数据写 SD |
+| `encode_proc` | 1 | 5 | 8KB | PPA显示 + H.264 + MV + AI + 状态机 + 双重检测 |
+| `sd_writer` | 1 | 2 | 4KB | 从 ready 队列取数据写 SD (暂未开录像) |
 | `app_video` (系统) | — | 默认 | — | 摄像头驱动，帧回调 |
 | LVGL tick | — | 默认 | — | UI 刷新，每 10ms |
 
@@ -216,29 +258,29 @@ python ouev_to_i420.py dump_0.ppa --png dump_0.png
 
 ## 未来蓝图
 
-### 第一阶段: 稳定性 (进行中)
+### 第一阶段: AI 接入 (进行中)
 
-- [ ] O_UYY_E_VYY 合成彩条测试确认数据格式
-- [ ] 两级 MV 分类实测调参（闭盖/手运动场景）
-- [ ] 视频画面异常根因确认与修复
-- [ ] 0KB 文件根除
+- [x] snake_detect 组件骨架 (PPA 缩放就绪, 模拟推理)
+- [x] activity_tracker 活动追踪 + JSONL 日志
+- [x] NTP 时间同步
+- [x] 三态状态机 (MONITOR → AI_VERIFY → RECORDING)
+- [ ] ESP-DL 真实推理接入 (YOLO11n INT8, 320×320)
+- [ ] 模型重新校准 (50-200 张 SC2336 真实帧)
 
-### 第二阶段: 帧率优化 (15-20fps)
+### 第二阶段: 完整功能
+
+- [ ] zone 区域配置加载 (SD 卡 zone.conf)
+- [ ] 每日 18:00 云端上传 (HTTP POST daily stats)
+- [ ] 设备心跳 + 命令轮询 (后端 API 对接)
+- [ ] OSD 信息叠加 (LVGL 图层叠加时间戳、状态图标)
+
+### 第三阶段: 优化与扩展
 
 - [ ] PPA 显示改为非阻塞模式（如硬件支持）
-- [ ] 评估 `espressif/motion_detect` 替代 H.264 MV 检测（MONITOR 模式免编码，省 48ms/帧）
-- [ ] 显示帧间隔从 3 帧调到 5 帧
-- [ ] 帧池从 4 扩到 6，降低 CAM→编码瓶颈掉帧
-
-### 第三阶段: 功能扩展
-
-- [ ] **人脸/宠物检测**: ESP-DL + 人脸/动物模型，精准识别宠物在画面中
-- [ ] **运动检测升级**: `espressif/motion_detect`（RGB888 输入, 640×360 stride2 仅 7ms）替换 MV 方案
-- [ ] **OSD 信息叠加**: LVGL 图层叠加时间戳、温度、状态图标
-- [ ] **双向音频**: ES8311 麦克风录音 + 扬声器播放，主人远程语音安抚宠物
-- [ ] **WiFi 实时推流**: RTSP/HLS 推流至手机 App
-- [ ] **云端存储**: 录像自动上传至阿里云 OSS / AWS S3
-- [ ] **电池供电**: PMU 电源管理，深度睡眠唤醒
+- [ ] 评估 `espressif/motion_detect` 替代 H.264 MV 检测
+- [ ] 双向音频: ES8311 麦克风录音 + 扬声器播放
+- [ ] WiFi 实时推流: RTSP/HLS 推流至手机 App
+- [ ] 云端存储: 录像自动上传至阿里云 OSS / AWS S3
 
 ### 架构演进
 

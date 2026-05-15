@@ -38,6 +38,8 @@
 #include "wifi_manager.h"
 #include "app_video.h"
 #include "storage_manager.h"
+#include "snake_detect.h"
+#include "activity_tracker.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -59,8 +61,9 @@
 /* ========================================================================== */
 
 typedef enum {
-    SYS_STATE_MONITOR,      /* 监控，不录像 (编码器同分辨率 800x800) */
-    SYS_STATE_RECORDING,    /* 高分辨率录像 */
+    SYS_STATE_MONITOR,      /* MV 监控，不录像，不 AI */
+    SYS_STATE_AI_VERIFY,    /* MV 触发 → AI 确认蛇存在 (每帧推理, 连续2帧命中) */
+    SYS_STATE_RECORDING,    /* AI 确认 → 活动追踪 + 双重检测 (暂不开录像) */
 } sys_state_t;
 
 /* 固定分辨率 —— MON 和 REC 统一为 800x800, MV 宏块数从 300 升到 2500 */
@@ -208,6 +211,16 @@ static int g_encode_frame_count = 0;
 static int     g_motion_trigger_count = 0;
 static int64_t g_last_motion_check_us = 0;
 
+/* AI_VERIFY 态变量 */
+static int     g_ai_verify_count = 0;       /* 连续 AI 确认帧数 */
+static int     g_ai_verify_total = 0;       /* AI_VERIFY 态已运行帧数 */
+#define AI_VERIFY_CONFIRM_FRAMES  2          /* 连续确认帧数 → 进入 RECORDING */
+#define AI_VERIFY_MAX_FRAMES     10          /* 超时帧数 → 退回 MONITOR */
+
+/* RECORDING 态双重检测变量 */
+static int     g_dual_check_frame_count = 0; /* 帧计数器，用于每秒一次 AI */
+#define DUAL_CHECK_INTERVAL_FRAMES 60        /* ~5秒 (12fps) */
+
 /* 前向声明 —— 函数定义在文件后面 */
 static esp_err_t ppa_display_process(uint8_t *in_buf, ppa_srm_color_mode_t in_cm,
                                       uint32_t in_w, uint32_t in_h,
@@ -232,32 +245,40 @@ static void encode_processor_task(void *arg)
         /* ---- 0. 延迟状态切换 ---- */
         if (g_has_pending_switch) {
             g_has_pending_switch = false;
-#if RECORDING_ENABLED
-            bool state_changed = (g_pending_state != g_state);
-            switch_state(g_pending_state);
+            sys_state_t target = g_pending_state;
 
-            if (g_state == SYS_STATE_RECORDING) {
-                uint32_t ts = esp_timer_get_time() / 1000000;
-                snprintf(g_current_filename, sizeof(g_current_filename),
-                         "VID_%08" PRIu32 ".mp4", ts);
-                esp_err_t ret = storage_manager_create_video_file(
-                    g_storage, g_current_filename,
-                    CAM_WIDTH, CAM_HEIGHT, record_enc_cfg.fps, record_enc_cfg.rc.bitrate);
-                if (ret == ESP_OK) {
-                    g_file_open = true;
-                    g_last_motion_check_us = esp_timer_get_time();
-                    g_motion_trigger_count = 0;
-                    ESP_LOGI(TAG, "Recording START: %s", g_current_filename);
-                }
+            /* MONITOR → AI_VERIFY: 同编码器配置, 直接切状态 */
+            if (g_state == SYS_STATE_MONITOR && target == SYS_STATE_AI_VERIFY) {
+                g_state = SYS_STATE_AI_VERIFY;
+                g_ai_verify_count = 0;
+                g_ai_verify_total = 0;
+                g_last_motion_check_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "→ AI_VERIFY (confirming snake...)");
             }
-
-            /* MON/REC 同分辨率 800x800, 无需丢帧; state_changed 仅标记位 */
-            (void)state_changed;
-#else
-            ESP_LOGI(TAG, "Motion triggered (recording disabled)");
-            g_last_motion_check_us = esp_timer_get_time();
-            g_motion_trigger_count = 0;
-#endif
+            /* AI_VERIFY → RECORDING: 活动追踪, 不录像, 保持 monitor 编码器 (只需 MV) */
+            else if (target == SYS_STATE_RECORDING) {
+                g_state = SYS_STATE_RECORDING;
+                uint32_t now_s = (uint32_t)time(NULL);
+                activity_tracker_start_event(now_s);
+                g_last_motion_check_us = esp_timer_get_time();
+                g_motion_trigger_count = 0;
+                g_dual_check_frame_count = 0;
+                ESP_LOGI(TAG, "→ RECORDING (tracking started, no video)");
+            }
+            /* 任意态 → MONITOR (停止).
+             * RECORDING 一直用的是 monitor 编码器, 不需重建, 直接改状态即可 */
+            else if (target == SYS_STATE_MONITOR) {
+                if (g_state == SYS_STATE_RECORDING) {
+                    activity_tracker_end_event((uint32_t)time(NULL));
+                }
+                g_state = SYS_STATE_MONITOR;
+                g_ai_verify_count = 0;
+                g_ai_verify_total = 0;
+                ESP_LOGI(TAG, "→ MONITOR");
+            }
+            else {
+                switch_state(target);
+            }
         }
 
         /* ---- 1. PPA 显示 (每 N 帧) ---- */
@@ -329,38 +350,102 @@ static void encode_processor_task(void *arg)
             static int debug_counter = 0;
             if (++debug_counter % 30 == 0) {
                 ESP_LOGI(TAG, "MV: raw=%" PRIu32 " strong=%" PRIu32 " max=%" PRIu32
-                         " | state=%s file:%s",
+                         " | state=%s",
                          mv_len, strong_mv, max_motion,
-                         g_state == SYS_STATE_MONITOR ? "MON" : "REC",
-                         g_file_open ? "OPEN" : "-");
+                         g_state == SYS_STATE_MONITOR ? "MON" :
+                         g_state == SYS_STATE_AI_VERIFY ? "AI_V" : "REC");
             }
         }
 
         /* ---- 5. MV 运动检测 (基于强运动块数 strong_mv) ---- */
+
+        /* 5a. MONITOR: MV 触发 → AI_VERIFY */
         if (g_state == SYS_STATE_MONITOR) {
             if (strong_mv > MOTION_TRIGGER_STRONG) {
                 g_motion_trigger_count++;
                 if (g_motion_trigger_count >= MOTION_TRIGGER_FRAMES) {
-                    ESP_LOGI(TAG, ">>> Motion trigger (raw=%" PRIu32 " strong=%" PRIu32
-                             " max=%" PRIu32 " x%d) -> RECORD <<<",
-                             mv_len, strong_mv, max_motion, g_motion_trigger_count);
+                    ESP_LOGI(TAG, ">>> Motion trigger (strong=%" PRIu32 " x%d) → AI_VERIFY <<<",
+                             strong_mv, g_motion_trigger_count);
                     g_motion_trigger_count = 0;
-                    g_pending_state = SYS_STATE_RECORDING;
+                    g_pending_state = SYS_STATE_AI_VERIFY;
                     g_has_pending_switch = true;
                 }
             } else {
                 g_motion_trigger_count = 0;
             }
-        } else if (g_state == SYS_STATE_RECORDING) {
-            if (strong_mv > MOTION_SUSTAIN_STRONG) {
-                g_last_motion_check_us = esp_timer_get_time();
+        }
+
+        /* 5b. AI_VERIFY: 每帧跑 AI 推理, 连续2帧确认蛇存在 → RECORDING */
+        else if (g_state == SYS_STATE_AI_VERIFY) {
+            snake_detect_result_t ai_result;
+            esp_err_t ai_ret = snake_detect_process(job.i420_data, &ai_result);
+            g_ai_verify_total++;
+
+            if (ai_ret == ESP_OK && ai_result.has_snake && ai_result.confidence > 0.5f) {
+                g_ai_verify_count++;
+                if (g_ai_verify_count >= AI_VERIFY_CONFIRM_FRAMES) {
+                    ESP_LOGI(TAG, ">>> AI snake confirmed (conf=%.2f, x%d/%d) → RECORDING <<<",
+                             ai_result.confidence, g_ai_verify_count, g_ai_verify_total);
+                    g_pending_state = SYS_STATE_RECORDING;
+                    g_has_pending_switch = true;
+                }
+            } else {
+                g_ai_verify_count = 0;
             }
-            int64_t now = esp_timer_get_time();
-            if (now - g_last_motion_check_us >= RECORDING_CHECK_INTERVAL) {
-                ESP_LOGI(TAG, ">>> No motion for 10s -> stopping <<<");
-                stop_recording();
+
+            /* 超时: 10 帧内未确认 → 退回 MONITOR */
+            if (g_ai_verify_total >= AI_VERIFY_MAX_FRAMES) {
+                ESP_LOGI(TAG, ">>> AI verify timeout (%d frames) → MONITOR <<<",
+                         g_ai_verify_total);
                 g_pending_state = SYS_STATE_MONITOR;
                 g_has_pending_switch = true;
+            }
+        }
+
+        /* 5c. RECORDING: 每秒双重检测 (MV + AI), 每秒记录位置, 暂不录像 */
+        else if (g_state == SYS_STATE_RECORDING) {
+            g_dual_check_frame_count++;
+
+            /* 每秒一次双重检测 */
+            if (g_dual_check_frame_count >= DUAL_CHECK_INTERVAL_FRAMES) {
+                g_dual_check_frame_count = 0;
+
+                bool mv_pass = (strong_mv > MOTION_SUSTAIN_STRONG);
+
+                snake_detect_result_t ai_result;
+                esp_err_t ai_ret = snake_detect_process(job.i420_data, &ai_result);
+                bool ai_pass = (ai_ret == ESP_OK && ai_result.has_snake && ai_result.confidence > 0.5f);
+
+                if (mv_pass && ai_pass) {
+                    g_last_motion_check_us = esp_timer_get_time();
+                }
+
+                ESP_LOGI(TAG, "Dual check: MV=%s AI=%s (conf=%.2f)",
+                         mv_pass ? "Y" : "N", ai_pass ? "Y" : "N",
+                         ai_result.confidence);
+            }
+
+            /* 双重检测 10 秒失败 → 停止追踪 */
+            int64_t now = esp_timer_get_time();
+            if (now - g_last_motion_check_us >= RECORDING_CHECK_INTERVAL) {
+                ESP_LOGI(TAG, ">>> No activity for 10s → stopping tracking <<<");
+                g_pending_state = SYS_STATE_MONITOR;
+                g_has_pending_switch = true;
+            }
+
+            /* 每秒记录位置 (从 AI bbox 推算蛇头位置) */
+            static int64_t g_last_pos_update_us = 0;
+            if (now - g_last_pos_update_us >= 1000000) {
+                g_last_pos_update_us = now;
+                uint32_t now_s = (uint32_t)time(NULL);
+
+                /* 位置用 bbox 中心（真实蛇头方向需要运动方向推算，延后） */
+                snake_detect_result_t ai_result;
+                if (snake_detect_process(job.i420_data, &ai_result) == ESP_OK && ai_result.has_snake) {
+                    float head_x = ai_result.x + ai_result.w * 0.5f;
+                    float head_y = ai_result.y + ai_result.h * 0.33f; /* bbox 前方 1/3 */
+                    activity_tracker_update_position(now_s, head_x, head_y);
+                }
             }
         }
 
@@ -732,7 +817,8 @@ static esp_err_t switch_state(sys_state_t new_state)
 
     g_state = new_state;
     ESP_LOGI(TAG, "State → %s",
-             new_state == SYS_STATE_MONITOR ? "MONITOR" : "RECORDING");
+             new_state == SYS_STATE_MONITOR ? "MONITOR" :
+             new_state == SYS_STATE_AI_VERIFY ? "AI_VERIFY" : "RECORDING");
     return ESP_OK;
 }
 
@@ -778,7 +864,8 @@ static void camera_frame_cb(
         float disp_fps = g_fps_display_count * 1000000.0f / (now - g_fps_last_time);
         ESP_LOGI(TAG, "FPS: %.1f (capture), state=%s, fmt=%s",
                  disp_fps,
-                 g_state == SYS_STATE_MONITOR ? "MON" : "REC",
+                 g_state == SYS_STATE_MONITOR ? "MON" :
+                 g_state == SYS_STATE_AI_VERIFY ? "AI_V" : "REC",
                  g_camera_fmt == APP_VIDEO_FMT_YUV420 ? "YUV420" : "RGB565");
         g_fps_frame_count = 0;
         g_fps_display_count = 0;
@@ -879,6 +966,11 @@ void app_main(void)
     }
     g_ppa_mutex = xSemaphoreCreateMutex();
 
+    /* ---- AI 蛇检测 (骨架: PPA 缩放就绪, 推理模拟) ---- */
+    if (snake_detect_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Snake detect init failed, AI features disabled");
+    }
+
     /* ---- 分配缓冲区 ---- */
     size_t lcd_buf_size = ALIGN_UP(BSP_LCD_H_RES * BSP_LCD_V_RES * 2,
                                    g_cache_line_size);
@@ -940,8 +1032,11 @@ void app_main(void)
     };
     g_storage = storage_manager_init(&storage_cfg);
     if (!g_storage) {
-        ESP_LOGW(TAG, "SD card init failed, recording disabled");
+        ESP_LOGW(TAG, "SD card init failed, some features disabled");
     }
+
+    /* ---- 活动追踪器 ---- */
+    activity_tracker_init();
 
     /* ---- 异步 SD 写入队列初始化 ---- */
 #if RECORDING_ENABLED
@@ -1024,11 +1119,12 @@ void app_main(void)
              CAM_WIDTH, CAM_HEIGHT,
              g_camera_fmt == APP_VIDEO_FMT_YUV420 ? "YUV420" : "RGB565",
              CAM_BUF_NUM);
-    ESP_LOGI(TAG, "  监控: %dx%d@%dfps → 运动触发 → 录像: %dx%d@%dfps",
-             MON_WIDTH, MON_HEIGHT, monitor_enc_cfg.fps,
-             CAM_WIDTH, CAM_HEIGHT, record_enc_cfg.fps);
+    ESP_LOGI(TAG, "  状态机: MONITOR → AI_VERIFY → RECORDING");
+    ESP_LOGI(TAG, "  AI 蛇检测: 骨架就绪 (模拟推理)");
     ESP_LOGI(TAG, "  SD卡: %s", g_storage ? "已就绪" : "未就绪");
+    ESP_LOGI(TAG, "  活动追踪: %s", "已就绪");
     ESP_LOGI(TAG, "  H.264编码器: %s", g_h264_enc ? "已就绪" : "故障");
+    ESP_LOGI(TAG, "  WiFi: %s", wifi_is_connected() ? "已连接" : "配网模式");
     ESP_LOGI(TAG, "========================================");
 
     /* 阻塞等待停止信号 */

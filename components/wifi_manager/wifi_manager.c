@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_wifi_remote.h"
 #include "esp_eap_client.h"
 #include "nvs_flash.h"
@@ -21,6 +22,18 @@ static const char *TAG = "wifi_mgr";
 static volatile bool s_connected = false;
 static char s_ip_str[16] = {0};
 static int s_retry_count = 0;
+static bool s_ntp_started = false;
+
+static void ntp_sync_start(void)
+{
+    if (s_ntp_started) return;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "pool.ntp.org");
+    esp_sntp_init();
+    s_ntp_started = true;
+    ESP_LOGI(TAG, "NTP sync started (ntp.aliyun.com, pool.ntp.org)");
+}
 
 static esp_err_t connect_to_wifi(const wifi_credential_t *cred);
 
@@ -93,6 +106,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ESP_LOGI(TAG, "WiFi connected: %s", s_ip_str);
         s_connected = true;
         s_retry_count = 0;
+        ntp_sync_start();
     }
 }
 
