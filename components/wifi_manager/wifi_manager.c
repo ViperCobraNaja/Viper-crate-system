@@ -6,7 +6,6 @@
 #include "esp_netif.h"
 #include "esp_sntp.h"
 #include "esp_wifi_remote.h"
-#include "esp_eap_client.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "wifi_manager.h"
@@ -115,23 +114,13 @@ static esp_err_t connect_to_wifi(const wifi_credential_t *cred)
     wifi_config_t cfg = {0};
     memcpy(cfg.sta.ssid, cred->ssid, sizeof(cfg.sta.ssid));
 
-    if (cred->auth_mode == WIFI_AUTH_WPA2_PSK || cred->auth_mode == WIFI_AUTH_WPA3_PSK
-        || cred->auth_mode == WIFI_AUTH_WPA_WPA2_PSK || cred->auth_mode == WIFI_AUTH_WPA2_WPA3_PSK) {
+    /* Treat everything with password as PSK. Enterprise EAP not supported
+     * by C6 slave firmware < 2.12.0 — RPC calls timeout 16s blocking camera init. */
+    if (cred->auth_mode != WIFI_AUTH_OPEN) {
         memcpy(cfg.sta.password, cred->password, sizeof(cfg.sta.password));
-    } else if (cred->auth_mode == WIFI_AUTH_WPA2_ENTERPRISE) {
-        cfg.sta.pmf_cfg.capable = true;
     }
-    /* WIFI_AUTH_OPEN: no password */
 
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
-
-    if (cred->auth_mode == WIFI_AUTH_WPA2_ENTERPRISE) {
-        esp_eap_client_set_identity((uint8_t *)cred->identity, strlen(cred->identity));
-        esp_eap_client_set_username((uint8_t *)cred->identity, strlen(cred->identity));
-        esp_eap_client_set_password((uint8_t *)cred->eap_password, strlen(cred->eap_password));
-        esp_eap_client_set_disable_time_check(true);
-        ESP_LOGI(TAG, "WPA2-Enterprise: identity=%s", cred->identity);
-    }
 
     ESP_LOGI(TAG, "Connecting to %s...", cred->ssid);
     return esp_wifi_connect();

@@ -124,6 +124,11 @@ esp_err_t app_video_wait_video_stop(void);
  */
 esp_err_t app_video_close(int video_fd);
 
+/**
+ * @brief Write a register value to the camera sensor via SCCB.
+ */
+esp_err_t app_video_sensor_write_reg(uint16_t regaddr, uint8_t value);
+
 #ifdef __cplusplus
 }
 #endif

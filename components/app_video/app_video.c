@@ -16,7 +16,11 @@
 #include "esp_log.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
+#include "esp_cam_sensor.h"
 #include "app_video.h"
+
+/* Private header — needed for esp_video_get_csi_video_device_sensor() */
+#include "../managed_components/espressif__esp_video/private_include/esp_video_device_internal.h"
 #include "bsp/esp-bsp.h"
 
 static const char *TAG = "app_video";
@@ -326,4 +330,12 @@ esp_err_t app_video_close(int video_fd)
 {
     close(video_fd);
     return ESP_OK;
+}
+
+esp_err_t app_video_sensor_write_reg(uint16_t regaddr, uint8_t value)
+{
+    esp_cam_sensor_device_t *sensor = esp_video_get_csi_video_device_sensor();
+    if (!sensor) return ESP_ERR_NOT_FOUND;
+    esp_cam_sensor_reg_val_t reg = { .regaddr = regaddr, .value = value };
+    return esp_cam_sensor_ioctl(sensor, ESP_CAM_SENSOR_IOC_S_REG, &reg);
 }

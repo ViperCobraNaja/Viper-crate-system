@@ -198,12 +198,12 @@ static int g_encode_frame_count = 0;
  *   强信号: mag >= 6    → 用于 trigger/sustain 判决
  *   800x800 噪声 ~1500 块 (mag 2-5), 手 ~200 强块 (mag 6+)
  */
-#define MV_NOISE_THRESHOLD        5    /* mag < 5 丢弃 */
-#define MV_STRONG_THRESHOLD       8    /* mag >= 8 为强运动块 */
-#define MOTION_TRIGGER_STRONG     200  /* 强运动块数 > 200 触发 */
+#define MV_NOISE_THRESHOLD        7    /* mag < 7 丢弃 */
+#define MV_STRONG_THRESHOLD       10   /* mag >= 12 为强运动块 */
+#define MOTION_TRIGGER_STRONG     220  /* 强运动块数 > 800 触发 */
 #define MOTION_TRIGGER_AVG        25
 #define MOTION_TRIGGER_FRAMES      5   /* 连续 5 帧触发 */
-#define MOTION_SUSTAIN_STRONG     100  /* 强运动块数 > 100 续录 */
+#define MOTION_SUSTAIN_STRONG     150  /* 强运动块数 > 500 续录 */
 #define MOTION_SUSTAIN_MV_COUNT   500
 #define MOTION_SUSTAIN_AVG        15
 #define RECORDING_CHECK_INTERVAL  10000000  /* 10 秒 */
@@ -349,9 +349,21 @@ static void encode_processor_task(void *arg)
 
             static int debug_counter = 0;
             if (++debug_counter % 30 == 0) {
+                /* Sample Y values from frame data to detect light flicker.
+                 * O_UYY_E_VYY: each row stride = w*3/2. Y at offsets 1,2 in each 3-byte group. */
+                const uint8_t *d = job.i420_data;
+                uint32_t stride = job.enc_w * 3 / 2;
+                uint32_t y_sum = 0;
+                int sample_count = 64;
+                for (int i = 0; i < sample_count; i++) {
+                    int row = i * (job.enc_h / sample_count);
+                    y_sum += d[row * stride + 1];
+                }
+                uint32_t y_avg = y_sum / sample_count;
+
                 ESP_LOGI(TAG, "MV: raw=%" PRIu32 " strong=%" PRIu32 " max=%" PRIu32
-                         " | state=%s",
-                         mv_len, strong_mv, max_motion,
+                         " Yavg=%" PRIu32 " | state=%s",
+                         mv_len, strong_mv, max_motion, y_avg,
                          g_state == SYS_STATE_MONITOR ? "MON" :
                          g_state == SYS_STATE_AI_VERIFY ? "AI_V" : "REC");
             }
@@ -1080,6 +1092,12 @@ void app_main(void)
         if (fd >= 0) {
             g_camera_fmt = try_fmts[i];
             ESP_LOGI(TAG, "Camera opened: %dx%d %s", CAM_WIDTH, CAM_HEIGHT, fmt_names[i]);
+
+            /* Set OV5647 50Hz anti-banding (China power grid) via SCCB */
+            app_video_sensor_write_reg(0x3c01, 0x80);  /* manual mode */
+            app_video_sensor_write_reg(0x3c00, 0x44);  /* 50Hz */
+            ESP_LOGI(TAG, "OV5647: 50Hz anti-banding enabled");
+
             break;
         }
         ESP_LOGW(TAG, "Camera format %s not supported, trying next...", fmt_names[i]);
